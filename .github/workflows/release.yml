@@ -43,12 +43,13 @@ jobs:
 
       - name: Download FFmpeg (LGPL build by BtbN)
         run: |
-          curl -fsSL -o "${{ matrix.ffmpeg_asset }}" \
+          mkdir ffmpeg-download ffmpeg-extract
+          ARCHIVE="ffmpeg-download/${{ matrix.ffmpeg_asset }}"
+          curl -fsSL -o "$ARCHIVE" \
             "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/${{ matrix.ffmpeg_asset }}"
-          mkdir ffmpeg-extract
-          case "${{ matrix.ffmpeg_asset }}" in
-            *.zip) unzip -q "${{ matrix.ffmpeg_asset }}" -d ffmpeg-extract ;;
-            *) tar -xf "${{ matrix.ffmpeg_asset }}" -C ffmpeg-extract ;;
+          case "$ARCHIVE" in
+            *.zip) unzip -q "$ARCHIVE" -d ffmpeg-extract ;;
+            *) tar -xf "$ARCHIVE" -C ffmpeg-extract ;;
           esac
 
       - name: Assemble package
@@ -91,8 +92,8 @@ jobs:
         with:
           name: ${{ matrix.platform }}
           path: |
-            *.tar.gz
-            *.zip
+            whatsapp-sound-sticker-bot-*.tar.gz
+            whatsapp-sound-sticker-bot-*.zip
           if-no-files-found: error
 
   publish:
