@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# WhatsApp session: these files give full access to the linked account. Never commit them.
+whatsapp_session/
+sesion_whatsapp/
+auth_info*/
+
+# Media produced or received while running the bot
+outputs/
+salidas/
+temp_*
+*.mp4
+*.webp
+*.ogg
+*.wav
+
+# Build output
+dist/
+
+# Local configuration and logs
+.env
+*.log
+npm-debug.log*
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

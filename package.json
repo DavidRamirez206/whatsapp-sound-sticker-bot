@@ -1,0 +1,44 @@
+{
+  "name": "whatsapp-sound-sticker-bot",
+  "version": "1.0.0",
+  "description": "WhatsApp bot that turns videos into animated stickers with sound.",
+  "main": "index.js",
+  "bin": {
+    "sound-sticker-bot": "index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test --test-reporter=spec \"test/**/*.test.js\"",
+    "test:unit": "node --test --test-reporter=spec \"test/unit/*.test.js\"",
+    "bundle": "node scripts/bundle.js",
+    "build:exe": "node scripts/bundle.js && node scripts/build-sea.js"
+  },
+  "keywords": [
+    "whatsapp",
+    "bot",
+    "stickers",
+    "baileys",
+    "ffmpeg",
+    "webp",
+    "opus"
+  ],
+  "author": "Ismael Barrionuevo",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DavidRamirez206/whatsapp-sound-sticker-bot.git"
+  },
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
+    "pino": "^10.4.0",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "postject": "^1.0.0-alpha.6"
+  }
+}
