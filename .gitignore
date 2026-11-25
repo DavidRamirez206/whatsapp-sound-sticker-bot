@@ -23,8 +23,30 @@ dist/
 *.log
 npm-debug.log*
 
-# Editors and OS
+# IDEs and editors
 .idea/
+*.iml
+*.iws
+*.ipr
+out/
 .vscode/
+*.code-workspace
+.history/
+.fleet/
+.zed/
+.cursor/
+*.sublime-project
+*.sublime-workspace
+.project
+.classpath
+.settings/
+nbproject/
+*.swp
+*.swo
+*~
+.vs/
+
+# Operating systems
 .DS_Store
 Thumbs.db
+desktop.ini
