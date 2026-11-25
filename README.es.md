@@ -179,7 +179,7 @@ Requisitos:
 3. **Comprueba las herramientas**
    ```bash
    node --version                                   # v22.12.0 o superior
-   ffmpeg -hide_banner -encoders | grep -E "libwebp_anim|libopus"   # deben aparecer los dos
+   ffmpeg -hide_banner -encoders | grep -E " libwebp | libopus "   # deben aparecer los dos
    ```
 4. **Descarga e inicia el bot**
    ```bash
@@ -309,33 +309,41 @@ $env:MAX_SECONDS=10; npm start
 WhatsApp rechaza stickers animados de más de **500 KB**, así que en clips largos hay que equilibrar fps y
 calidad de imagen. La versión anterior del bot tenía tres problemas con videos de más de 10 s:
 
-1. Un presupuesto fijo de frames (130) obligaba a bajar los clips largos a 5–6 fps sin importar el contenido.
-2. Adivinaba la calidad con una sola muestra de 3 segundos; en videos con mucho detalle se equivocaba y
-   terminaba en 5 fps con la calidad mínima.
-3. Usaba el codificador WebP de imagen fija con el nivel de esfuerzo más lento, ~15× más lento que el
-   nivel 4 para archivos solo ~2 % más pequeños.
+1. Un presupuesto fijo de frames (130) obligaba a bajar todos los clips largos a 5–6 fps, incluso los
+   simples que podían tener más.
+2. Adivinaba la calidad con una sola muestra de 3 segundos del centro del clip; en videos con mucho detalle
+   se equivocaba y terminaba haciendo una escalera de cinco codificaciones completas.
+3. Codificaba con el nivel de esfuerzo más lento, muchas veces más lento que el nivel 4 para archivos solo
+   ~2 % más pequeños.
 
 El codificador actual (`src/media/sticker.js`):
 
-1. Usa el codificador WebP **animado** de FFmpeg (`libwebp_anim`), que comprime las diferencias entre
-   frames: archivos mucho más pequeños con la misma calidad.
+1. Codifica **cada frame como una imagen completa** con `libwebp` de FFmpeg. El codificador animado
+   (`libwebp_anim`) da archivos más pequeños, pero reutiliza bloques del frame anterior cuando "casi no
+   cambiaron", con una tolerancia que crece al bajar la calidad; con las calidades que necesitan los clips
+   largos deja bloques viejos y pixelados sobre la imagen en movimiento, por eso no se usa.
 2. Arma una muestra con tres ventanas de 1 segundo repartidas a lo largo del clip y la codifica en 8
-   niveles de calidad en paralelo, midiendo el **costo de un frame** en cada calidad. El tamaño del sticker
-   completo se puede predecir porque crece de forma lineal con la cantidad de frames.
-3. Elige los **fps más altos que mantienen calidad ≥ 30** dentro del presupuesto (luego ≥ 12, luego cualquiera),
-   con el tope de `MAX_FRAMES`. Los videos estáticos o simples conservan hasta 15 fps aunque sean largos.
-4. Codifica el clip completo una vez (rara vez dos) con nivel de esfuerzo 4.
+   niveles de calidad en paralelo, midiendo el **costo de un frame** en cada calidad. Como los frames son
+   independientes, el tamaño del sticker completo se puede predecir: crece de forma lineal con los frames.
+3. Elige los **fps más altos que mantienen calidad ≥ 30** dentro del presupuesto (luego ≥ 12), con el tope
+   de `MAX_FRAMES`. Si ni así cabe, deja 5 fps y la mejor calidad que quepa: se ven mejor frames nítidos
+   que unos cuantos frames extra borrosos. Los videos simples o casi estáticos conservan hasta 15 fps
+   aunque sean largos.
+4. Codifica el clip completo con nivel de esfuerzo 4. Si sobró espacio, prueba un escalón más de calidad
+   y lo conserva si sigue por debajo de 500 KB.
 
-Medido en la misma máquina con videos reales:
+Medido en la misma máquina con videos reales (el PSNR compara cada frame del sticker con el frame
+original del video; más alto = más nítido):
 
 | Clip | Antes | Ahora |
 | --- | --- | --- |
-| 6,5 s, 1280×2276 | 15 fps, q50 – 14,3 s | 15 fps, q75 – 8,3 s |
-| 18,9 s, 800×480 | 5 fps, q6 – 24,4 s | 6 fps, q30 – 8,6 s |
-| 22,9 s, 800×480 | 5 fps, q6 – 25,2 s | 6 fps, q30 – 8,3 s |
-| 25 s (recortado de 120 s), 496×368 | 5 fps, q6 – 10,2 s | 6 fps, q12 – 11,3 s |
+| 6,5 s, 1280×2276 | 15 fps, q50, 26,4 dB – 14,3 s | 15 fps, q75, 26,7 dB – 10,0 s |
+| 18,9 s, 800×480 | 5 fps, q6, 29,9 dB – 24,4 s | 5 fps, q6, 29,9 dB – 10,1 s |
+| 22,9 s, 800×480 | 5 fps, q6, 30,8 dB – 25,2 s | 5 fps, q6, 30,8 dB – 18,0 s |
+| 25 s (recortado de 120 s), 496×368 | 5 fps, q6, 33,5 dB – 10,2 s | 5 fps, q12, 34,5 dB – 18,3 s |
 
-"q" es la calidad de libwebp (0–100); el tiempo es el de la conversión completa.
+"q" es la calidad de libwebp (0–100); el tiempo es el de la conversión completa. Los clips con mucho
+detalle y movimiento de 20 s o más simplemente no admiten más de ~5 fps en 500 KB sin perder nitidez visible.
 
 ---
 

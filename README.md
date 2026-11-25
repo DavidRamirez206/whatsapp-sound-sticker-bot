@@ -180,7 +180,7 @@ Requirements:
 3. **Check the tools**
    ```bash
    node --version                                   # v22.12.0 or newer
-   ffmpeg -hide_banner -encoders | grep -E "libwebp_anim|libopus"   # both must appear
+   ffmpeg -hide_banner -encoders | grep -E " libwebp | libopus "   # both must appear
    ```
 4. **Download and start the bot**
    ```bash
@@ -309,33 +309,39 @@ $env:MAX_SECONDS=10; npm start
 WhatsApp rejects animated stickers over **500 KB**, so for long clips the encoder has to trade frame
 rate against image quality. The earlier version of this bot had three problems with clips over 10 s:
 
-1. A fixed frame budget (130 frames) forced long clips down to 5–6 fps regardless of the content.
-2. It guessed the quality from a single 3-second sample, guessed wrong on detailed videos and then
-   fell back to 5 fps at the lowest quality.
-3. It used the still-image WebP encoder at the slowest effort level, which is ~15× slower than effort 4
-   for ~2 % smaller files.
+1. A fixed frame budget (130 frames) forced every long clip down to 5–6 fps, even simple ones that
+   could afford more.
+2. It guessed the quality from a single 3-second sample from the middle of the clip, guessed wrong on
+   detailed videos and then ran a ladder of five full encodes.
+3. It encoded at the slowest effort level, many times slower than level 4 for files only ~2 % smaller.
 
 The current encoder (`src/media/sticker.js`):
 
-1. Uses FFmpeg's **animated** WebP encoder (`libwebp_anim`), which compresses the differences between
-   frames: far smaller files at the same quality.
+1. Encodes **every frame as a complete picture** with FFmpeg's `libwebp`. The animated encoder
+   (`libwebp_anim`) produces smaller files but reuses blocks from the previous frame when they "barely
+   changed", with a tolerance that grows as quality drops; at the qualities long clips need, that leaves
+   stale, pixelated blocks over moving images, so it is not used.
 2. Cuts a sample made of three 1-second windows spread across the clip and encodes it at 8 quality
-   levels in parallel, measuring the **cost of one frame** at each quality. The size of the full sticker
-   is predictable from that because it grows linearly with the number of frames.
-3. Chooses the **highest frame rate that keeps quality ≥ 30** within the budget (then ≥ 12, then anything),
-   capped by `MAX_FRAMES`. Static or simple videos keep up to 15 fps even when they are long.
-4. Encodes the whole clip once (rarely twice) at effort level 4.
+   levels in parallel, measuring the **cost of one frame** at each quality. Since frames are independent,
+   the size of the full sticker is predictable: it grows linearly with the number of frames.
+3. Chooses the **highest frame rate that keeps quality ≥ 30** within the budget (then ≥ 12), capped by
+   `MAX_FRAMES`. If not even that fits, it keeps 5 fps and the best quality that fits: sharp frames look
+   better than a few extra blurry ones. Simple or mostly static videos keep up to 15 fps even when long.
+4. Encodes the whole clip at effort level 4. If the result left room, it tries one quality step higher
+   and keeps it if it still fits under 500 KB.
 
-Measured on the same machine with real videos:
+Measured on the same machine with real videos (PSNR compares every sticker frame with the original
+video frame; higher is sharper):
 
 | Clip | Before | After |
 | --- | --- | --- |
-| 6.5 s, 1280×2276 | 15 fps, q50 – 14.3 s | 15 fps, q75 – 8.3 s |
-| 18.9 s, 800×480 | 5 fps, q6 – 24.4 s | 6 fps, q30 – 8.6 s |
-| 22.9 s, 800×480 | 5 fps, q6 – 25.2 s | 6 fps, q30 – 8.3 s |
-| 25 s (cut from 120 s), 496×368 | 5 fps, q6 – 10.2 s | 6 fps, q12 – 11.3 s |
+| 6.5 s, 1280×2276 | 15 fps, q50, 26.4 dB – 14.3 s | 15 fps, q75, 26.7 dB – 10.0 s |
+| 18.9 s, 800×480 | 5 fps, q6, 29.9 dB – 24.4 s | 5 fps, q6, 29.9 dB – 10.1 s |
+| 22.9 s, 800×480 | 5 fps, q6, 30.8 dB – 25.2 s | 5 fps, q6, 30.8 dB – 18.0 s |
+| 25 s (cut from 120 s), 496×368 | 5 fps, q6, 33.5 dB – 10.2 s | 5 fps, q12, 34.5 dB – 18.3 s |
 
-"q" is libwebp's quality (0–100); the time is the full conversion.
+"q" is libwebp's quality (0–100); the time is the full conversion. Detailed, high-motion clips of
+20 s or more simply do not fit more than ~5 fps in 500 KB without visibly losing sharpness.
 
 ---
 
