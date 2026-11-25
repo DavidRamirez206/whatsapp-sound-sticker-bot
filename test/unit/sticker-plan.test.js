@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
-    planEncoding, lighterSetting, sampleWindows, mapWithConcurrency, stickerFilter,
+    planEncoding, lighterSetting, higherQualityThatFits, sampleWindows, mapWithConcurrency, stickerFilter,
     QUALITY_LADDER, FPS_LADDER
 } = require('../../src/media/sticker');
 
@@ -39,6 +39,14 @@ test('falls back to the lightest setting and flags it when nothing fits', () => 
     assert.equal(plan.quality, QUALITY_LADDER[QUALITY_LADDER.length - 1]);
 });
 
+test('when quality 12 does not fit, keeps the lowest frame rate with the best quality that fits', () => {
+    const bytesPerFrame = { 75: 20000, 60: 15000, 45: 12000, 30: 9000, 20: 7000, 12: 6000, 6: 4500, 2: 4000 };
+    const plan = planEncoding({ duration: 20, bytesPerFrame, budgetBytes: budget, maxFrames: 1000 });
+    assert.equal(plan.fps, 5);
+    assert.equal(plan.quality, 6, 'q6 at 5 fps fits, so it must not drop to q2 or raise the frame rate');
+    assert.equal(plan.fitsBudget, true);
+});
+
 test('uses the lowest frame rate when even it exceeds maxFrames', () => {
     const plan = planEncoding({ duration: 25, bytesPerFrame: costTable(100), budgetBytes: budget, maxFrames: 30 });
     assert.equal(plan.fps, 5);
@@ -50,6 +58,14 @@ test('lighterSetting lowers quality first, then frame rate, then squeezes qualit
     assert.deepEqual(lighterSetting({ fps: 5, quality: 12 }), { fps: 5, quality: 6 });
     assert.deepEqual(lighterSetting({ fps: 15, quality: 50 }), { fps: 15, quality: 45 });
     assert.equal(lighterSetting({ fps: 5, quality: 2 }), null);
+});
+
+test('higherQualityThatFits proposes the next quality only when its scaled size fits', () => {
+    const bytesPerFrame = { 75: 9000, 60: 8000, 45: 7000, 30: 6000, 20: 5000, 12: 4000, 6: 4860, 2: 4180 };
+    assert.equal(higherQualityThatFits({ quality: 2, bytes: 429 * 1024 }, bytesPerFrame, 500 * 1024), 6);
+    assert.equal(higherQualityThatFits({ quality: 2, bytes: 490 * 1024 }, bytesPerFrame, 500 * 1024), null);
+    assert.equal(higherQualityThatFits({ quality: 75, bytes: 100 }, bytesPerFrame, 500 * 1024), null, 'nothing above the top quality');
+    assert.equal(higherQualityThatFits({ quality: 2, bytes: 100 }, { 2: 1000 }, 500 * 1024), null, 'needs a measurement for the higher quality');
 });
 
 test('sampleWindows spreads windows across the clip and samples short clips whole', () => {

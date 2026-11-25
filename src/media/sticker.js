@@ -3,20 +3,27 @@
 /**
  * Video -> animated WebP sticker (512x512, transparent padding, under 500 KB).
  *
- * The output size is dominated by one trade-off: frames per second versus
- * per-frame quality. Measurements on real clips show that the size of a WebP
- * animation grows linearly with its frame count, and that the cost of a single
- * frame barely depends on the frame rate. That makes the final size predictable
- * from a tiny sample:
+ * Every frame is encoded as a complete picture with FFmpeg's `libwebp` encoder.
+ * The animated encoder (`libwebp_anim`) is deliberately not used: to save space
+ * it keeps blocks from the previous frame whenever they changed by less than a
+ * tolerance that grows as quality drops (about 15 levels per channel at quality
+ * 30, 20 at quality 12), which leaves stale blocks all over moving images.
+ *
+ * The output size is then dominated by one trade-off: frames per second versus
+ * per-frame quality. Because frames are independent, the size grows linearly
+ * with the frame count and the cost of one frame does not depend on the frame
+ * rate, so the final size is predictable from a tiny sample:
  *
  *   1. Cut a short sample (three 1-second windows spread across the clip).
  *   2. Encode the sample once per quality level, in parallel, and measure the
  *      average bytes per frame for each quality.
  *   3. Pick the highest frame rate that still leaves a decent quality inside the
- *      size budget (see {@link planEncoding}), capped by `maxFrames` so long
- *      stickers do not stutter on phones.
+ *      size budget; when no frame rate allows that, keep the lowest frame rate
+ *      and the best quality that fits (see {@link planEncoding}). The frame rate
+ *      is capped by `maxFrames` so long stickers do not stutter on phones.
  *   4. Encode the full clip once; if it is still too heavy, step down quality
- *      or frame rate and try again.
+ *      or frame rate and try again. If it came out with room to spare, try one
+ *      quality step higher and keep it when it still fits.
  *
  * Short clips (<= 6 s) are first tried with a single high quality encode,
  * which is almost always under the limit.
@@ -36,20 +43,22 @@ const FPS_LADDER = Object.freeze([15, 12, 10, 8, 6, 5]);
 /** libwebp quality levels (0-100) sampled for long clips, best first. */
 const QUALITY_LADDER = Object.freeze([75, 60, 45, 30, 20, 12, 6, 2]);
 /**
- * Minimum acceptable quality, relaxed in order. The planner first looks for the
- * highest fps that fits with quality >= 30, then >= 12, then anything.
+ * Minimum quality worth trading frames for, relaxed in order. The planner first
+ * looks for the highest fps that fits with quality >= 30, then >= 12.
  */
-const QUALITY_FLOORS = Object.freeze([30, 12, 0]);
+const QUALITY_FLOORS = Object.freeze([30, 12]);
 
 /**
- * libwebp effort (0-6). Level 4 produces files within ~2 % of level 6 while
- * being about 15x faster on animated output, so it is used for every encode.
+ * libwebp effort (0-6). Level 4 produces files within ~2 % of level 6 at the
+ * same quality while being many times faster, so it is used for every encode.
  */
 const COMPRESSION_LEVEL = 4;
 
 /** Fraction of the 500 KB limit targeted by the prediction (leaves room for estimation error). */
-const BUDGET_RATIO = 0.9;
+const BUDGET_RATIO = 0.95;
 const MAX_FULL_ENCODES = 4;
+/** An upgrade is attempted when its predicted size is within this fraction of the limit (the result is verified anyway). */
+const UPGRADE_MARGIN = 1.03;
 const SAMPLE = Object.freeze({ windows: 3, windowSeconds: 1, fps: 10 });
 
 /**
@@ -75,7 +84,7 @@ function stickerFilter(fps) {
 async function encodeWebp(input, output, { fps, quality, duration }) {
     await runFfmpeg([
         ...(duration ? ['-t', duration.toFixed(3)] : []), '-i', input,
-        '-an', '-c:v', 'libwebp_anim', '-lossless', '0', '-q:v', String(quality),
+        '-an', '-c:v', 'libwebp', '-lossless', '0', '-q:v', String(quality),
         '-compression_level', String(COMPRESSION_LEVEL),
         '-vf', stickerFilter(fps), '-loop', '0', output
     ]);
@@ -171,9 +180,11 @@ async function measureBytesPerFrame(input, output, duration) {
  * Chooses frame rate and quality for a clip from measured per-frame costs.
  *
  * Frame rates allowed by `maxFrames` are tried from highest to lowest, first
- * requiring quality >= 30, then >= 12, then anything (see {@link QUALITY_FLOORS}).
- * The first combination whose predicted size fits the budget wins; within a
- * frame rate the highest fitting quality is used. Pure function.
+ * requiring quality >= 30, then >= 12 (see {@link QUALITY_FLOORS}). The first
+ * combination whose predicted size fits the budget wins; within a frame rate the
+ * highest fitting quality is used. If even 12 does not fit, the lowest allowed
+ * frame rate is used with the best quality that fits, because sharper frames
+ * look better than a few extra blurry ones. Pure function.
  *
  * @param {object} input
  * @param {number} input.duration Clip length in seconds.
@@ -199,6 +210,10 @@ function planEncoding({ duration, bytesPerFrame, budgetBytes, maxFrames }) {
     }
 
     const fps = fpsOptions[fpsOptions.length - 1];
+    for (const quality of qualities) {
+        const predictedBytes = predict(fps, quality);
+        if (predictedBytes <= budgetBytes) return { fps, quality, predictedBytes, fitsBudget: true };
+    }
     const quality = qualities[qualities.length - 1] ?? QUALITY_LADDER[QUALITY_LADDER.length - 1];
     return { fps, quality, predictedBytes: predict(fps, quality), fitsBudget: false };
 }
@@ -218,6 +233,44 @@ function lighterSetting({ fps, quality }) {
     if (lowerFps !== undefined) return { fps: lowerFps, quality };
     if (lowerQuality !== undefined) return { fps, quality: lowerQuality };
     return null;
+}
+
+/**
+ * Quality one step above `quality` whose predicted size, scaled from the size
+ * actually obtained, still fits under `maxBytes`. Pure function.
+ *
+ * @param {{ quality: number, bytes: number }} current Result of an encode that fit.
+ * @param {Record<number, number>} bytesPerFrame quality -> average bytes per frame.
+ * @param {number} maxBytes
+ * @returns {number | null}
+ */
+function higherQualityThatFits({ quality, bytes }, bytesPerFrame, maxBytes) {
+    const higher = [...QUALITY_LADDER].reverse().find((q) => q > quality);
+    if (higher === undefined || !bytesPerFrame[higher] || !bytesPerFrame[quality]) return null;
+    const predicted = (bytes * bytesPerFrame[higher]) / bytesPerFrame[quality];
+    return predicted <= maxBytes * UPGRADE_MARGIN ? higher : null;
+}
+
+/**
+ * The plan aims below the limit to absorb estimation errors. When the result
+ * left enough room, one more encode at the next quality step is attempted and
+ * kept only if it still fits.
+ *
+ * @returns {Promise<{ encoded: boolean, result: { fps: number, quality: number, bytes: number } | null }>}
+ */
+async function tryHigherQuality(input, output, duration, current, bytesPerFrame, maxBytes) {
+    const quality = higherQualityThatFits(current, bytesPerFrame, maxBytes);
+    if (quality === null) return { encoded: false, result: null };
+
+    const candidate = `${output}.upgrade.webp`;
+    try {
+        const bytes = await encodeWebp(input, candidate, { fps: current.fps, quality, duration });
+        if (bytes > maxBytes) return { encoded: true, result: null };
+        fs.renameSync(candidate, output);
+        return { encoded: true, result: { fps: current.fps, quality, bytes } };
+    } finally {
+        fs.rmSync(candidate, { force: true });
+    }
 }
 
 /**
@@ -257,7 +310,11 @@ async function convertToSticker(input, output, duration, { maxBytes, maxFrames }
         encodes++;
         const bytes = await encodeWebp(input, output, { ...setting, duration });
         last = { fps: setting.fps, quality: setting.quality, bytes };
-        if (bytes <= maxBytes) return { ...last, encodes, strategy: 'planned', oversized: false };
+        if (bytes <= maxBytes) {
+            const upgraded = await tryHigherQuality(input, output, duration, last, bytesPerFrame, maxBytes);
+            if (upgraded.encoded) encodes++;
+            return { ...(upgraded.result || last), encodes, strategy: 'planned', oversized: false };
+        }
         setting = lighterSetting(setting);
     }
     return { ...last, encodes, strategy: 'planned', oversized: true };
@@ -266,5 +323,5 @@ async function convertToSticker(input, output, duration, { maxBytes, maxFrames }
 module.exports = {
     STICKER_SIZE, FPS_LADDER, QUALITY_LADDER, QUALITY_FLOORS, COMPRESSION_LEVEL,
     stickerFilter, encodeWebp, sampleWindows, mapWithConcurrency,
-    measureBytesPerFrame, planEncoding, lighterSetting, convertToSticker
+    measureBytesPerFrame, planEncoding, lighterSetting, higherQualityThatFits, convertToSticker
 };

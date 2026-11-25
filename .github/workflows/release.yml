@@ -71,7 +71,7 @@ jobs:
             > "$OUT/FFMPEG-NOTICE.txt"
 
           ENCODERS=$("$OUT/ffmpeg$EXT" -hide_banner -encoders)
-          echo "$ENCODERS" | grep -q libwebp_anim || { echo "bundled FFmpeg lacks libwebp_anim"; exit 1; }
+          echo "$ENCODERS" | grep -qE '\slibwebp\s' || { echo "bundled FFmpeg lacks libwebp"; exit 1; }
           echo "$ENCODERS" | grep -q libopus || { echo "bundled FFmpeg lacks libopus"; exit 1; }
 
           OUTPUT=$(FFMPEG_PATH=missing "$OUT/sound-sticker-bot$EXT" </dev/null 2>&1 || true)

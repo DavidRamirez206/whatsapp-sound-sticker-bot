@@ -99,7 +99,7 @@ async function assertFfmpegReady() {
             'are on your PATH, or place them next to the executable, or set FFMPEG_PATH and FFPROBE_PATH.');
     }
     const { stdout } = await execFileAsync(binaries.ffmpeg, ['-hide_banner', '-encoders'], { maxBuffer: MAX_OUTPUT_BYTES });
-    const missing = ['libwebp_anim', 'libopus'].filter((encoder) => !String(stdout).includes(encoder));
+    const missing = ['libwebp', 'libopus'].filter((encoder) => !new RegExp(`\\s${encoder}\\s`).test(String(stdout)));
     if (missing.length) {
         throw new Error(`Your FFmpeg build lacks the encoder(s): ${missing.join(', ')}. Install a full FFmpeg build.`);
     }
