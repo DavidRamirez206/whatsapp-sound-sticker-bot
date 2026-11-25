@@ -1,0 +1,116 @@
+name: Release
+
+# Builds standalone executables for Windows and Linux, bundles FFmpeg next to
+# them and publishes everything as a GitHub release.
+# Trigger it by pushing a version tag:  git tag v1.0.0 && git push origin v1.0.0
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x64
+            ffmpeg_asset: ffmpeg-n8.1-latest-linux64-lgpl-8.1.tar.xz
+          - os: windows-latest
+            platform: windows-x64
+            ffmpeg_asset: ffmpeg-n8.1-latest-win64-lgpl-8.1.zip
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - run: npm run test:unit
+      - run: npm run build:exe
+
+      - name: Download FFmpeg (LGPL build by BtbN)
+        run: |
+          curl -fsSL -o "${{ matrix.ffmpeg_asset }}" \
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/${{ matrix.ffmpeg_asset }}"
+          mkdir ffmpeg-extract
+          case "${{ matrix.ffmpeg_asset }}" in
+            *.zip) unzip -q "${{ matrix.ffmpeg_asset }}" -d ffmpeg-extract ;;
+            *) tar -xf "${{ matrix.ffmpeg_asset }}" -C ffmpeg-extract ;;
+          esac
+
+      - name: Assemble package
+        run: |
+          EXT=""; [ "$RUNNER_OS" = "Windows" ] && EXT=".exe"
+          NAME="whatsapp-sound-sticker-bot-${GITHUB_REF_NAME}-${{ matrix.platform }}"
+          OUT="package/$NAME"
+          FF_DIR=$(dirname "$(find ffmpeg-extract -type f -name "ffmpeg$EXT" | head -n 1)")
+          mkdir -p "$OUT"
+          cp "dist/sound-sticker-bot$EXT" "$OUT/"
+          cp "$FF_DIR/ffmpeg$EXT" "$FF_DIR/ffprobe$EXT" "$OUT/"
+          cp README.md README.es.md LICENSE .env.example "$OUT/"
+          LICENSE_FILE=$(find ffmpeg-extract -maxdepth 2 -name 'LICENSE*' | head -n 1)
+          [ -n "$LICENSE_FILE" ] && cp "$LICENSE_FILE" "$OUT/FFMPEG-LICENSE.txt"
+          printf '%s\n' \
+            "ffmpeg and ffprobe in this folder are unmodified LGPL builds of FFmpeg (https://ffmpeg.org)" \
+            "made by https://github.com/BtbN/FFmpeg-Builds (asset ${{ matrix.ffmpeg_asset }})." \
+            "Their source code is available at https://github.com/FFmpeg/FFmpeg and in that repository's releases." \
+            > "$OUT/FFMPEG-NOTICE.txt"
+
+          ENCODERS=$("$OUT/ffmpeg$EXT" -hide_banner -encoders)
+          echo "$ENCODERS" | grep -q libwebp_anim || { echo "bundled FFmpeg lacks libwebp_anim"; exit 1; }
+          echo "$ENCODERS" | grep -q libopus || { echo "bundled FFmpeg lacks libopus"; exit 1; }
+
+          OUTPUT=$(FFMPEG_PATH=missing "$OUT/sound-sticker-bot$EXT" </dev/null 2>&1 || true)
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -q "FFmpeg/FFprobe not found" || { echo "executable did not start correctly"; exit 1; }
+
+          echo "PACKAGE_NAME=$NAME" >> "$GITHUB_ENV"
+
+      - name: Archive (Linux)
+        if: runner.os == 'Linux'
+        run: tar -czf "$PACKAGE_NAME.tar.gz" -C package "$PACKAGE_NAME"
+
+      - name: Archive (Windows)
+        if: runner.os == 'Windows'
+        run: 7z a -tzip "$PACKAGE_NAME.zip" "./package/$PACKAGE_NAME" > /dev/null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: |
+            *.tar.gz
+            *.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: release
+        run: sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
