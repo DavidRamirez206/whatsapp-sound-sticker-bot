@@ -1,6 +1,6 @@
 {
   "name": "whatsapp-sound-sticker-bot",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "WhatsApp bot that turns videos into animated stickers with sound.",
   "main": "index.js",
   "bin": {
