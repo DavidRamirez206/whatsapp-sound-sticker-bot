@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { runStep, isNetworkError, errorCause, describeError } = require('../../src/retry');
+const { runStep, isNetworkError, errorCause, describeError, withTimeout, StepTimeoutError } = require('../../src/retry');
 
 const noSleep = async () => {};
 const networkError = () => Object.assign(new Error('fetch failed'), { cause: { code: 'ETIMEDOUT', name: 'Error', message: 'timeout' } });
@@ -51,4 +51,27 @@ test('runStep gives up after the configured retries', async () => {
     let calls = 0;
     await assert.rejects(runStep('upload', async () => { calls++; throw networkError(); }, { retries: 1, sleep: noSleep }));
     assert.equal(calls, 2);
+});
+
+test('withTimeout rejects a promise that never settles', async () => {
+    await assert.rejects(withTimeout(new Promise(() => {}), 20, 'upload'), (error) =>
+        error instanceof StepTimeoutError && /upload timed out/.test(error.message));
+    assert.equal(await withTimeout(Promise.resolve(7), 20, 'x'), 7);
+    assert.equal(await withTimeout(Promise.resolve(8), 0, 'x'), 8, '0 disables the limit');
+});
+
+test('runStep retries a step that timed out', async () => {
+    let calls = 0;
+    const result = await runStep('download', () => {
+        calls++;
+        return calls === 1 ? new Promise(() => {}) : Promise.resolve('ok');
+    }, { retries: 1, timeoutMs: 20, sleep: noSleep });
+    assert.equal(result, 'ok');
+    assert.equal(calls, 2);
+});
+
+test('a dropped WhatsApp connection counts as a transient error', () => {
+    assert.equal(isNetworkError(new Error('Connection Closed')), true);
+    assert.equal(isNetworkError(Object.assign(new Error('x'), { output: { statusCode: 428 } })), true);
+    assert.equal(isNetworkError(new StepTimeoutError('x', 10)), true);
 });

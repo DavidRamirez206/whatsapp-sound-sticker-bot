@@ -8,6 +8,9 @@
  *   2. Next to the running executable (the release bundles ship them there),
  *      either directly or inside an `ffmpeg/` subfolder.
  *   3. The system `PATH`.
+ *
+ * Every process gets a time limit and is killed when it exceeds it, so a
+ * corrupt or unusual input can never leave a conversion running forever.
  */
 
 const fs = require('node:fs');
@@ -17,6 +20,28 @@ const { promisify } = require('node:util');
 
 const execFileAsync = promisify(execFile);
 const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
+
+/** Per-process time limit in milliseconds. */
+let processTimeoutMs = 180_000;
+
+/**
+ * Changes the time limit applied to every FFmpeg/FFprobe process.
+ *
+ * @param {number} ms
+ */
+function setProcessTimeout(ms) {
+    processTimeoutMs = ms;
+}
+
+/**
+ * Options shared by every spawned process: output buffer, time limit and a
+ * forceful kill once it is exceeded.
+ *
+ * @param {import('node:child_process').ExecFileOptions} [extra]
+ */
+const processOptions = (extra = {}) => ({
+    maxBuffer: MAX_OUTPUT_BYTES, timeout: processTimeoutMs, killSignal: /** @type {const} */ ('SIGKILL'), ...extra
+});
 
 /**
  * @param {'ffmpeg' | 'ffprobe'} name
@@ -45,7 +70,7 @@ const binaries = { ffmpeg: resolveBinary('ffmpeg'), ffprobe: resolveBinary('ffpr
  * @param {import('node:child_process').ExecFileOptions} [options]
  */
 function runFfmpeg(args, options = {}) {
-    return execFileAsync(binaries.ffmpeg, ['-v', 'error', '-y', ...args], { maxBuffer: MAX_OUTPUT_BYTES, ...options });
+    return execFileAsync(binaries.ffmpeg, ['-v', 'error', '-y', ...args], processOptions(options));
 }
 
 /**
@@ -55,8 +80,7 @@ function runFfmpeg(args, options = {}) {
  * @returns {Promise<Buffer>}
  */
 async function runFfmpegToBuffer(args) {
-    const { stdout } = await execFileAsync(binaries.ffmpeg, ['-v', 'error', '-y', ...args],
-        { maxBuffer: MAX_OUTPUT_BYTES, encoding: 'buffer' });
+    const { stdout } = await execFileAsync(binaries.ffmpeg, ['-v', 'error', '-y', ...args], processOptions({ encoding: 'buffer' }));
     return /** @type {Buffer} */ (stdout);
 }
 
@@ -67,7 +91,7 @@ async function runFfmpegToBuffer(args) {
  * @returns {Promise<string>} stderr
  */
 async function runFfmpegVerbose(args) {
-    const { stderr } = await execFileAsync(binaries.ffmpeg, ['-hide_banner', '-nostats', ...args], { maxBuffer: MAX_OUTPUT_BYTES });
+    const { stderr } = await execFileAsync(binaries.ffmpeg, ['-hide_banner', '-nostats', ...args], processOptions());
     return String(stderr);
 }
 
@@ -78,7 +102,7 @@ async function runFfmpegVerbose(args) {
  * @returns {Promise<any>}
  */
 async function runFfprobeJson(args) {
-    const { stdout } = await execFileAsync(binaries.ffprobe, ['-v', 'error', ...args, '-of', 'json'], { maxBuffer: MAX_OUTPUT_BYTES });
+    const { stdout } = await execFileAsync(binaries.ffprobe, ['-v', 'error', ...args, '-of', 'json'], processOptions());
     return JSON.parse(String(stdout));
 }
 
@@ -106,4 +130,4 @@ async function assertFfmpegReady() {
     return version;
 }
 
-module.exports = { binaries, resolveBinary, runFfmpeg, runFfmpegToBuffer, runFfmpegVerbose, runFfprobeJson, assertFfmpegReady };
+module.exports = { binaries, resolveBinary, setProcessTimeout, runFfmpeg, runFfmpegToBuffer, runFfmpegVerbose, runFfprobeJson, assertFfmpegReady };
