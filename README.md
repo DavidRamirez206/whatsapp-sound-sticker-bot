@@ -25,6 +25,7 @@ before using it.
 - [Option B: run from source](#option-b-run-from-source)
   - [Windows](#windows-1)
   - [Linux](#linux-1)
+- [Option C: Docker](#option-c-docker)
 - [Linking your WhatsApp account](#linking-your-whatsapp-account)
 - [Usage](#usage)
 - [Configuration](#configuration)
@@ -62,6 +63,7 @@ before using it.
 - Login by QR code or by pairing code.
 - Privacy by default: received videos are processed in a temporary folder and deleted afterwards.
 - Standalone executables for Windows and Linux with FFmpeg included.
+- Hardened Docker image for amd64 and arm64, with health check ([Option C](#option-c-docker)).
 - Unit and integration tests (`node:test`), CI on Windows and Linux.
 
 ## Disclaimer
@@ -220,6 +222,71 @@ Adjust `User`, the paths and the Node version (`which node`) to your machine.
 
 ---
 
+## Option C: Docker
+
+Runs the bot in a container with FFmpeg included, for servers, NAS boxes, Raspberry Pi 4/5 (arm64) or
+any machine that already uses Docker. On a Windows desktop the executable (Option A) is simpler.
+
+Requirements: Docker Engine 24+ with Compose v2 (Docker Desktop on Windows/macOS).
+
+1. Get the project files (only `docker-compose.yml` is strictly needed):
+
+   ```bash
+   git clone https://github.com/DavidRamirez206/whatsapp-sound-sticker-bot.git
+   cd whatsapp-sound-sticker-bot
+   cp .env.example .env        # optional: adjust COMMAND, MAX_SECONDS, TZ...
+   ```
+
+2. Start it and watch the logs to link the account:
+
+   ```bash
+   docker compose up -d
+   docker compose logs -f      # scan the QR code, then Ctrl+C to stop watching (the bot keeps running)
+   ```
+
+   If the QR code is hard to scan in the logs, set `PAIRING_NUMBER` in `.env` and use the pairing code
+   instead (see [Linking your WhatsApp account](#linking-your-whatsapp-account)).
+
+3. Day-to-day:
+
+   ```bash
+   docker compose ps           # STATUS shows "healthy" when it is connected
+   docker compose logs -f      # live logs
+   docker compose restart      # after editing .env
+   docker compose pull && docker compose up -d   # update to the latest image
+   docker compose down         # stop (the session is kept)
+   ```
+
+The image is `ghcr.io/davidramirez206/whatsapp-sound-sticker-bot` (tags `latest`, `1`, `1.2`, `1.2.0`).
+`docker compose up` downloads it, or builds it locally from the `Dockerfile` if it is not available.
+Set `TZ` (for example `TZ=America/Bogota`) so log times match your clock.
+
+How the container is set up, and why:
+
+| Setting | Reason |
+| --- | --- |
+| Named volume `bot-data` mounted at `/data` | Holds the session (`/data/whatsapp_session`). It survives updates and `docker compose down`. `docker compose down -v` **deletes it** and you must link again. |
+| Runs as the unprivileged `node` user, `read_only`, `cap_drop: ALL`, `no-new-privileges` | The bot processes videos from strangers with FFmpeg; if a malformed file ever exploited FFmpeg, the attacker would be confined to a container that cannot modify itself or gain privileges. |
+| `tmpfs` at `/tmp` | Received videos and temporary files live in memory and disappear when the container stops. |
+| `cpus`, `mem_limit`, `pids_limit` | A huge or malicious video cannot take the whole machine down. |
+| `restart: unless-stopped`, `init: true` | Restarts after crashes and reboots; signals reach Node so `docker compose down` closes the session cleanly. |
+| Health check | The bot writes its connection state to `HEALTH_FILE`; Docker marks the container `unhealthy` when the process freezes, the session is closed (logged out, replaced) or it has been offline for more than 15 minutes. Waiting for the first QR scan counts as healthy. |
+| Log rotation (3 x 10 MB) | Logs cannot fill the disk. |
+| Fixed `container_name`, session lock | Only **one** instance may use a session. Do not `docker compose up --scale`, and do not run the executable with a copy of the same session: a second instance refuses to start (`already in use by another instance`). |
+
+Treat the volume like a password: anyone who can run `docker` commands on that machine can read it and
+use your account. To back it up:
+
+```bash
+docker run --rm -v whatsapp-sound-sticker-bot_bot-data:/data -v "$PWD":/backup busybox \
+  tar czf /backup/bot-data.tgz -C /data .
+```
+
+(The volume name is prefixed with the folder name; check it with `docker volume ls`.) Keep that file
+somewhere private.
+
+---
+
 ## Linking your WhatsApp account
 
 The bot works as one more **linked device** of an existing WhatsApp account, like WhatsApp Web.
@@ -295,6 +362,8 @@ Settings are environment variables. The easiest way is a `.env` file next to the
 | `TEST_COMMAND` | `!t` | (Debug only) Sends 5 stickers with different audio encodings to compare which ones play. |
 | `VERIFY_UPLOAD` | same as `DEBUG` | Re-downloads every upload and checks hash and playability. |
 | `FFMPEG_PATH`, `FFPROBE_PATH` | *(auto)* | Custom FFmpeg binaries. By default they are searched next to the executable and then on `PATH`. |
+| `SESSION_LOCK` | `1` | Refuses to start when another instance is using the same `SESSION_DIR` (they would disconnect each other). Keeps a `<session>.lock` file next to the folder while running. |
+| `HEALTH_FILE` | *(empty; set in Docker)* | File where the connection state is written every 15 s for health checks (`scripts/healthcheck.js`). |
 
 Examples:
 
@@ -376,9 +445,13 @@ The bot is meant to run unattended for days, so it never fails silently:
   resent sticker still has sound.
 - **Errors are contained.** A broken message, a failing job or an unexpected exception is logged with its
   cause and the bot keeps serving the next ones. Ctrl+C or a service stop closes the session cleanly.
+- **One instance per session.** A second copy of the bot pointed at the same session refuses to start
+  instead of fighting the first one for the connection. A lock left by a crash expires after a minute.
+- **Supervisors can see its state.** With `HEALTH_FILE` set (the Docker image does it) the connection
+  state is written every 15 s, and `scripts/healthcheck.js` turns it into healthy / unhealthy.
 - The bot does not mark the account as "online", so your phone keeps receiving notifications.
 
-These behaviours are covered by tests in `test/unit/connection.test.js` and `test/unit/bot.test.js`.
+These behaviours are covered by tests in `test/unit/` (`connection`, `bot`, `session-lock` and `health`).
 
 ---
 
@@ -397,6 +470,8 @@ src/
 ├── ttl-cache.js              Bounded cache with expiry
 ├── workdir.js                Temporary / saved work folders
 ├── logger.js                 Console logging (hides Signal session dumps)
+├── health.js                 Health file writer and evaluation
+├── session-lock.js           One instance per session folder
 ├── protobuf.js               Schema-less protobuf reader
 ├── sticker-audio-patch.js    Adds the audio (field 26) to outgoing stickers
 ├── media/
@@ -413,7 +488,9 @@ src/
     └── inspect.js            Debug: analyse incoming sound stickers
 scripts/
 ├── bundle.js                 esbuild bundle → dist/bot.cjs
-└── build-sea.js              Node single executable → dist/sound-sticker-bot(.exe)
+├── build-sea.js              Node single executable → dist/sound-sticker-bot(.exe)
+└── healthcheck.js            Docker health probe
+Dockerfile, docker-compose.yml, .dockerignore   Container image and hardened service definition
 test/
 ├── unit/                     Pure logic tests
 └── integration/              Real FFmpeg pipeline tests (skipped without FFmpeg)
@@ -453,6 +530,10 @@ The workflow tests the code, builds the executables on Windows and Linux, adds t
 [LGPL FFmpeg builds from BtbN](https://github.com/BtbN/FFmpeg-Builds), checks that they include the required
 encoders, and publishes the archives plus `SHA256SUMS.txt` on the release page.
 
+The same tag triggers `.github/workflows/docker.yml`, which builds the image for amd64 and arm64 and pushes it
+to GitHub Container Registry. CI also builds the image on every push, runs the media tests with its FFmpeg and
+checks that it starts as a non-root user with a read-only file system.
+
 ## Troubleshooting
 
 | Problem | Solution |
@@ -461,8 +542,10 @@ encoders, and publishes the archives plus `SHA256SUMS.txt` on the release page.
 | `Your FFmpeg build lacks the encoder(s)` | Your FFmpeg is a minimal build. Install a full build (`Gyan.FFmpeg` on Windows, RPM Fusion on Fedora). |
 | The QR code is unreadable | Make the terminal bigger or use Windows Terminal, or log in with `PAIRING_NUMBER`. |
 | `logged out` | The device was unlinked from the phone. Delete `whatsapp_session/` and link again. |
-| Nothing happens when sending `!a` | The caption must be exactly `!a` and the message must be a video (not a GIF). Look in the console for `[IN]` (received), `[SKIP]` (sent before the bot started, or too old) or `[ERR]` (failed, with the cause). Commands sent while the bot was off are ignored on purpose; send them again. If there is no line at all, look for `[CONNECTION]`: the bot may be reconnecting. |
+| Nothing happens when sending `!a` | The caption must start with `!a` (`!a` or `!a any text`) and the message must be a video (not a GIF). Look in the console for `[IN]` (received), `[SKIP]` (sent before the bot started, or too old) or `[ERR]` (failed, with the cause). Commands sent while the bot was off are ignored on purpose; send them again. If there is no line at all, look for `[CONNECTION]`: the bot may be reconnecting. |
 | `closed: this session was opened somewhere else` | The bot is running twice with the same `whatsapp_session/`. Close the other one. |
+| `already in use by another instance` | Another bot (executable, `npm start` or container) is using that session. Close it. If none is running (for example after a crash), wait one minute and start again. |
+| Docker shows `unhealthy` | Run `docker compose logs --tail 50`: the reason is there (logged out, session replaced, long outage). `docker exec sound-sticker-bot node /app/scripts/healthcheck.js` prints the current verdict. |
 | `fetch failed` / `ETIMEDOUT` | Network problem talking to WhatsApp's media servers. The bot retries automatically; check your connection or firewall. |
 | The sticker arrives without sound | The recipient's WhatsApp may not support stickers with sound yet (update it). With `DEBUG=1`, use `!t` to compare audio encodings. |
 | The sound is out of sync | Adjust `AUDIO_LEAD_MS` (e.g. `0`, `100`, `200`). |
