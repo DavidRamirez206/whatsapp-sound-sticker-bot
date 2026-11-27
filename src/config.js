@@ -79,8 +79,11 @@ function loadConfig(env = process.env, cwd = process.cwd()) {
         audioLeadMs: parseNumber(env.AUDIO_LEAD_MS, 100, { min: 0, max: 2000 }),
 
         maxParallelJobs: parseNumber(env.MAX_PARALLEL_JOBS, 2, { min: 1, max: 16 }),
-        maxMessageAgeSeconds: 120,
+        maxMessageAgeSeconds: parseNumber(env.MAX_MESSAGE_AGE_SECONDS, 600, { min: 30 }),
+        jobTimeoutMs: parseNumber(env.JOB_TIMEOUT_SECONDS, 300, { min: 30 }) * 1000,
+        ffmpegTimeoutMs: parseNumber(env.FFMPEG_TIMEOUT_SECONDS, 180, { min: 10 }) * 1000,
         replyToMessage: parseFlag(env.REPLY_TO_MESSAGE, true),
+        notifyErrors: parseFlag(env.NOTIFY_ERRORS, true),
 
         sessionDir: path.resolve(cwd, env.SESSION_DIR || 'whatsapp_session'),
         pairingNumber: (env.PAIRING_NUMBER || '').replace(/\D/g, ''),

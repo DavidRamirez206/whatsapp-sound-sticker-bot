@@ -30,6 +30,10 @@ test('loadConfig provides safe defaults', () => {
     assert.equal(config.saveOutputs, false, 'received videos must not be kept on disk by default');
     assert.equal(config.debug, false);
     assert.equal(config.verifyUpload, false);
+    assert.equal(config.maxMessageAgeSeconds, 600, 'commands sent during a short outage are still answered');
+    assert.equal(config.jobTimeoutMs, 300_000);
+    assert.equal(config.ffmpegTimeoutMs, 180_000);
+    assert.equal(config.notifyErrors, true, 'failures are reported to the chat by default');
     assert.equal(config.sessionDir, path.resolve('/bot', 'whatsapp_session'));
     assert.ok(Object.isFrozen(config));
 });
