@@ -65,11 +65,10 @@ test('parseCommand accepts videos sent as documents with a caption', () => {
     assert.equal(parseCommand(message, baseConfig).kind, 'sticker');
 });
 
-test('parseCommand finds videos wrapped by disappearing messages, view-once and albums', () => {
+test('parseCommand finds videos wrapped by disappearing messages, albums and documents', () => {
     const video = { caption: '!a', seconds: 3 };
     const wrapped = {
         ephemeral: { ephemeralMessage: { message: { videoMessage: video } } },
-        viewOnce: { viewOnceMessageV2: { message: { videoMessage: video } } },
         album: { associatedChildMessage: { message: { videoMessage: video } } },
         ephemeralDocument: { ephemeralMessage: { message: { documentWithCaptionMessage: { message: { videoMessage: video } } } } }
     };
@@ -77,6 +76,13 @@ test('parseCommand finds videos wrapped by disappearing messages, view-once and 
         const command = parseCommand({ key: { id: name }, message: content }, baseConfig);
         assert.equal(command && command.kind, 'sticker', name);
         assert.equal(command.video.seconds, 3, name);
+    }
+});
+
+test('parseCommand does not unwrap view-once videos', () => {
+    const video = { caption: '!a', seconds: 3 };
+    for (const key of ['viewOnceMessage', 'viewOnceMessageV2', 'viewOnceMessageV2Extension']) {
+        assert.equal(parseCommand({ key: { id: key }, message: { [key]: { message: { videoMessage: video } } } }, baseConfig), null, key);
     }
 });
 

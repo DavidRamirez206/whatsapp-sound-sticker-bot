@@ -21,7 +21,6 @@
  * the bot from handling the next ones.
  */
 
-const { normalizeMessageContent } = require('@whiskeysockets/baileys');
 const { log, formatKb } = require('./logger');
 const { describeError, withTimeout } = require('./retry');
 const { createQueue } = require('./queue');
@@ -34,16 +33,26 @@ const { sendText } = require('./whatsapp/send');
 /** How many processed message ids are remembered to ignore duplicates. */
 const SEEN_IDS_LIMIT = 1000;
 
+/** Messages that wrap the real content and are unwrapped to find the video. */
+const CONTENT_WRAPPERS = Object.freeze(['ephemeralMessage', 'documentWithCaptionMessage', 'associatedChildMessage']);
+const MAX_WRAPPER_DEPTH = 5;
+
 /**
  * Returns the video payload of a message. WhatsApp wraps the real content in
  * other messages in common situations: chats with disappearing messages
- * (`ephemeralMessage`), view-once media, albums (`associatedChildMessage`) and
- * videos sent as documents; all of them are unwrapped here.
+ * (`ephemeralMessage`), albums (`associatedChildMessage`) and videos sent as
+ * documents (`documentWithCaptionMessage`); those are unwrapped here.
  *
  * @param {any} content `message.message`
  */
 function videoOf(content) {
-    return normalizeMessageContent(content)?.videoMessage || null;
+    let current = content;
+    for (let depth = 0; current && depth <= MAX_WRAPPER_DEPTH; depth++) {
+        if (current.videoMessage) return current.videoMessage;
+        const wrapper = CONTENT_WRAPPERS.map((key) => current[key]).find(Boolean);
+        current = wrapper && wrapper.message;
+    }
+    return null;
 }
 
 /**
