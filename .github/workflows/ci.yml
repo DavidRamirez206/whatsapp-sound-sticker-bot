@@ -35,3 +35,33 @@ jobs:
 
       - run: npm ci
       - run: npm test
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: docker build -t sound-sticker-bot:ci .
+
+      - name: Media tests with the image's FFmpeg
+        run: >
+          docker run --rm --init --read-only --tmpfs /tmp:size=512m
+          --entrypoint node -v "$PWD":/src:ro -w /src
+          sound-sticker-bot:ci --test test/integration/media.test.js
+
+      - name: Starts hardened, reports health and shows the login QR
+        run: |
+          docker run -d --name bot --init --read-only --tmpfs /tmp:size=512m \
+            --cap-drop ALL --security-opt no-new-privileges:true sound-sticker-bot:ci
+          for i in $(seq 1 30); do
+            docker logs bot 2>&1 | grep -q "Scan this QR code" && break
+            sleep 2
+          done
+          docker logs bot 2>&1 | grep -v '^[▄█▀ ]*$'
+          docker logs bot 2>&1 | grep -q "Scan this QR code"
+          docker exec bot node /app/scripts/healthcheck.js
+          test "$(docker exec bot id -un)" = node
+          docker stop bot
+          docker logs bot 2>&1 | grep -q "SIGTERM received"
