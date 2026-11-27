@@ -1,0 +1,41 @@
+# Runs the bot in a container. First start:
+#   docker compose up -d && docker compose logs -f   (scan the QR code shown in the logs)
+# Only ONE instance may use a session: do not scale this service and do not run the
+# executable with the same session at the same time.
+services:
+  bot:
+    image: ghcr.io/davidramirez206/whatsapp-sound-sticker-bot:latest
+    build: .
+    container_name: sound-sticker-bot
+    restart: unless-stopped
+    init: true
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      TZ: ${TZ:-UTC}
+      SESSION_DIR: /data/whatsapp_session
+      OUTPUTS_DIR: /data/outputs
+      HEALTH_FILE: /tmp/sound-sticker-bot/health.json
+    volumes:
+      - bot-data:/data
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    cpus: 2
+    mem_limit: 1g
+    pids_limit: 256
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  # Holds the WhatsApp login: whoever reads it controls the linked account.
+  bot-data:

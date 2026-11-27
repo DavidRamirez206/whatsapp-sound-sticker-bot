@@ -1,0 +1,25 @@
+# Secrets and runtime state never enter the image
+.env
+.env.*
+!.env.example
+whatsapp_session*/
+*.lock
+health.json
+outputs/
+salidas/
+temp_*
+
+# Not needed to run the bot
+node_modules/
+dist/
+test/
+.git/
+.github/
+*.md
+!README.md
+*.mp4
+*.webp
+*.ogg
+*.log
+.vscode/
+.idea/
