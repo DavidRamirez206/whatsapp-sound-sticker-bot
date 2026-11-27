@@ -15,6 +15,7 @@
  * the bot from handling the next ones.
  */
 
+const { normalizeMessageContent } = require('@whiskeysockets/baileys');
 const { log, formatKb } = require('./logger');
 const { describeError, withTimeout } = require('./retry');
 const { createQueue } = require('./queue');
@@ -28,17 +29,20 @@ const { sendText } = require('./whatsapp/send');
 const SEEN_IDS_LIMIT = 1000;
 
 /**
- * Returns the video payload of a message, whether it was sent as a regular
- * video or as a document with a caption.
+ * Returns the video payload of a message. WhatsApp wraps the real content in
+ * other messages in common situations: chats with disappearing messages
+ * (`ephemeralMessage`), view-once media, albums (`associatedChildMessage`) and
+ * videos sent as documents; all of them are unwrapped here.
  *
  * @param {any} content `message.message`
  */
 function videoOf(content) {
-    return content.videoMessage || content.documentWithCaptionMessage?.message?.videoMessage || null;
+    return normalizeMessageContent(content)?.videoMessage || null;
 }
 
 /**
- * Decides whether a message is a bot command. Pure function.
+ * Decides whether a message is a bot command: a video whose caption starts with
+ * the command word (`!a`, `!A`, `!a whatever`). Pure function.
  *
  * @param {any} message Incoming `WAMessage`.
  * @param {{ command: string, testCommand: string, debug: boolean }} config
@@ -47,10 +51,10 @@ function videoOf(content) {
 function parseCommand(message, config) {
     if (!message || !message.message) return null;
     const video = videoOf(message.message);
-    const caption = video?.caption?.trim().toLowerCase();
-    if (!video || !caption) return null;
-    if (caption === config.command) return { kind: 'sticker', video };
-    if (config.debug && caption === config.testCommand) return { kind: 'test', video };
+    const firstWord = video?.caption?.trim().split(/\s+/)[0].toLowerCase();
+    if (!video || !firstWord) return null;
+    if (firstWord === config.command) return { kind: 'sticker', video };
+    if (config.debug && firstWord === config.testCommand) return { kind: 'test', video };
     return null;
 }
 
@@ -182,6 +186,19 @@ function createBot(config, {
     const jobs = [];
 
     /**
+     * Logs recent videos that arrive without the command, so a wrong or missing
+     * caption is visible in the console instead of looking like a deaf bot.
+     *
+     * @param {any} message
+     */
+    function logIgnoredVideo(message) {
+        if (!videoOf(message.message)) return;
+        const age = messageAgeSeconds(message);
+        if (age !== null && age > config.maxMessageAgeSeconds) return;
+        log('IN', `video without the ${config.command} caption ignored | chat=${message.key.remoteJid}`);
+    }
+
+    /**
      * Handles one incoming message. Errors stay inside this message.
      *
      * @param {any} message
@@ -197,7 +214,11 @@ function createBot(config, {
         }
 
         const result = classifyMessage(message, config);
-        if (result.action === 'ignore' || !seen.add(message.key.id)) return;
+        if (result.action === 'ignore') {
+            logIgnoredVideo(message);
+            return;
+        }
+        if (!seen.add(message.key.id)) return;
 
         const sender = message.key.fromMe ? 'me' : (message.key.participant || message.key.remoteJid);
         if (result.action === 'skip') {

@@ -61,6 +61,50 @@ test('parseCommand accepts videos sent as documents with a caption', () => {
     assert.equal(parseCommand(message, baseConfig).kind, 'sticker');
 });
 
+test('parseCommand finds videos wrapped by disappearing messages, view-once and albums', () => {
+    const video = { caption: '!a', seconds: 3 };
+    const wrapped = {
+        ephemeral: { ephemeralMessage: { message: { videoMessage: video } } },
+        viewOnce: { viewOnceMessageV2: { message: { videoMessage: video } } },
+        album: { associatedChildMessage: { message: { videoMessage: video } } },
+        ephemeralDocument: { ephemeralMessage: { message: { documentWithCaptionMessage: { message: { videoMessage: video } } } } }
+    };
+    for (const [name, content] of Object.entries(wrapped)) {
+        const command = parseCommand({ key: { id: name }, message: content }, baseConfig);
+        assert.equal(command && command.kind, 'sticker', name);
+        assert.equal(command.video.seconds, 3, name);
+    }
+});
+
+test('parseCommand accepts text after the command word but not other words', () => {
+    assert.equal(parseCommand(videoMessage({ caption: '!a hola bot' }), baseConfig).kind, 'sticker');
+    assert.equal(parseCommand(videoMessage({ caption: '!a\nline two' }), baseConfig).kind, 'sticker');
+    assert.equal(parseCommand(videoMessage({ caption: '!ab' }), baseConfig), null);
+    assert.equal(parseCommand(videoMessage({ caption: 'hola !a' }), baseConfig), null);
+});
+
+test('a recent video without the command is logged instead of ignored silently', async () => {
+    const { bot, deliver, handled } = makeBot();
+    deliver(videoMessage({ caption: 'look at this' }));
+    deliver(videoMessage({ caption: '' }));
+    deliver(videoMessage({ caption: 'old one', ageSeconds: 7200 }));
+    await bot.settle();
+    assert.deepEqual(handled, []);
+    assert.equal(logs.filter((line) => /video without the !a caption ignored/.test(line)).length, 2);
+});
+
+test('a command in a chat with disappearing messages is processed', async () => {
+    const { bot, deliver, handled } = makeBot();
+    const message = {
+        key: { id: 'EPH1', remoteJid: 'chat@s.whatsapp.net', fromMe: false },
+        messageTimestamp: nowSeconds(),
+        message: { ephemeralMessage: { message: { videoMessage: { caption: '!a', seconds: 4 } } } }
+    };
+    deliver(message);
+    await bot.settle();
+    assert.deepEqual(handled, ['EPH1']);
+});
+
 test('parseCommand ignores other messages', () => {
     assert.equal(parseCommand(videoMessage({ caption: 'hello' }), baseConfig), null);
     assert.equal(parseCommand({ message: { videoMessage: {} } }, baseConfig), null);
