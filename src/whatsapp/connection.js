@@ -18,6 +18,9 @@
  *   so WhatsApp's "resend this message" requests still work after a reconnection.
  * - {@link waitForOpen} lets long jobs fetch the current socket right before
  *   each network operation instead of holding on to one that may have died.
+ * - Every delivery says whether it belongs to the first session after start-up,
+ *   so messages queued while the bot was not running can be told apart from
+ *   messages queued during a reconnection.
  */
 
 const pino = require('pino');
@@ -81,8 +84,9 @@ function backoffDelay(attempt, { baseMs = BACKOFF.baseMs, maxMs = BACKOFF.maxMs,
 /**
  * @param {object} options
  * @param {ReturnType<typeof import('../config').loadConfig>} options.config
- * @param {(event: { messages: any[], type: string }, sock: any) => void} options.onMessages
- *        Called for every `messages.upsert` of the live socket. Exceptions are caught and logged.
+ * @param {(event: { messages: any[], type: string }, sock: any, meta: { firstSession: boolean }) => void} options.onMessages
+ *        Called for every `messages.upsert` of the live socket. `meta.firstSession` is true until
+ *        the connection has been lost once after start-up. Exceptions are caught and logged.
  * @param {object} [options.dependencies] Baileys functions and timings, replaceable in tests.
  */
 function createConnection({ config, onMessages, dependencies = {} }) {
@@ -102,6 +106,8 @@ function createConnection({ config, onMessages, dependencies = {} }) {
     let generation = 0;
     let open = false;
     let everOpened = false;
+    /** Generation of the socket that opened first after start-up. */
+    let firstSessionGeneration = null;
     /** A socket exists and has not reported `close` yet (it may still be logging in). */
     let socketAlive = false;
     let connecting = false;
@@ -162,6 +168,7 @@ function createConnection({ config, onMessages, dependencies = {} }) {
             const downForMs = Date.now() - downSince;
             const outage = everOpened && downForMs > 5000 ? ` (was offline ${Math.round(downForMs / 1000)}s)` : '';
             everOpened = true;
+            if (firstSessionGeneration === null) firstSessionGeneration = socketGeneration;
             markOpen(socket);
             log('CONNECTION', `linked${outage}. ` +
                 `Send a video with the caption ${config.command} to get a sticker with sound.`);
@@ -219,7 +226,8 @@ function createConnection({ config, onMessages, dependencies = {} }) {
             socket.ev.on('messages.upsert', (event) => {
                 if (socketGeneration !== generation) return;
                 try {
-                    onMessages(event, socket);
+                    const firstSession = firstSessionGeneration === null || socketGeneration === firstSessionGeneration;
+                    onMessages(event, socket, { firstSession });
                 } catch (handlerError) {
                     log('ERR', `message handler failed: ${describeError(handlerError)}`);
                 }

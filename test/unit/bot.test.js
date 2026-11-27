@@ -8,7 +8,9 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { parseCommand, classifyMessage, messageAgeSeconds, createSeenSet, runJob, createBot } = require('../../src/bot');
+const {
+    parseCommand, classifyMessage, looksLikeCommandAttempt, messageAgeSeconds, createSeenSet, runJob, createBot
+} = require('../../src/bot');
 const { clipDuration } = require('../../src/handlers');
 const { UserError } = require('../../src/errors');
 const { waitUntil, sleep } = require('../helpers/fake-baileys');
@@ -46,8 +48,10 @@ function makeBot({ config = {}, sticker } = {}) {
         },
         reply: async (conn, chat, text) => { replies.push(text); }
     });
-    const deliver = (...messages) => onMessages({ messages, type: 'notify' }, {});
-    return { bot, deliver, replies, handled };
+    const deliver = (...messages) => onMessages({ messages, type: 'notify' }, {}, { firstSession: true });
+    /** Delivers messages the way WhatsApp hands over queued ones. */
+    const deliverQueued = (firstSession, ...messages) => onMessages({ messages, type: 'append' }, {}, { firstSession });
+    return { bot, deliver, deliverQueued, replies, handled };
 }
 
 test('parseCommand recognises the sticker command case-insensitively', () => {
@@ -83,14 +87,63 @@ test('parseCommand accepts text after the command word but not other words', () 
     assert.equal(parseCommand(videoMessage({ caption: 'hola !a' }), baseConfig), null);
 });
 
-test('a recent video without the command is logged instead of ignored silently', async () => {
+test('looksLikeCommandAttempt spots mistyped commands only', () => {
+    for (const caption of ['! a', '¡a', '!A.', 'hola !a', ' !a?']) assert.equal(looksLikeCommandAttempt(caption, '!a'), true, caption);
+    for (const caption of ['look at this', '', null, 'a!', 'jaja']) assert.equal(looksLikeCommandAttempt(caption, '!a'), false, String(caption));
+});
+
+test('a mistyped command is logged; ordinary videos from other people are not', async () => {
     const { bot, deliver, handled } = makeBot();
+    deliver(videoMessage({ caption: '! a' }));
     deliver(videoMessage({ caption: 'look at this' }));
     deliver(videoMessage({ caption: '' }));
-    deliver(videoMessage({ caption: 'old one', ageSeconds: 7200 }));
     await bot.settle();
     assert.deepEqual(handled, []);
-    assert.equal(logs.filter((line) => /video without the !a caption ignored/.test(line)).length, 2);
+    assert.equal(logs.filter((line) => /video ignored: its caption is not !a/.test(line)).length, 1);
+});
+
+test('with DEBUG every ignored video is logged', async () => {
+    const { bot, deliver } = makeBot({ config: { debug: true } });
+    deliver(videoMessage({ caption: 'look at this' }));
+    await bot.settle();
+    assert.equal(logs.filter((line) => /video ignored/.test(line)).length, 1);
+});
+
+test('commands sent before the bot started are not processed nor answered', async () => {
+    const { bot, deliverQueued, handled, replies } = makeBot();
+    deliverQueued(true, videoMessage({ id: 'BEFORE', ageSeconds: 60 }));
+    await bot.settle();
+    assert.deepEqual(handled, []);
+    assert.deepEqual(replies, [], 'no messages are sent to chats about things from before start-up');
+    assert.ok(logs.some((line) => /BEFORE was sent before the bot started/.test(line)));
+});
+
+test('videos queued before start-up do not flood the log', async () => {
+    const { bot, deliverQueued } = makeBot();
+    deliverQueued(true, videoMessage({ caption: '! a' }), videoMessage({ caption: 'old video' }));
+    await bot.settle();
+    assert.equal(logs.filter((line) => /video ignored/.test(line)).length, 0);
+});
+
+test('commands missed during a reconnection while running are processed', async () => {
+    const { bot, deliverQueued, handled } = makeBot();
+    deliverQueued(false, videoMessage({ id: 'DURING_OUTAGE', ageSeconds: 90 }));
+    await bot.settle();
+    assert.deepEqual(handled, ['DURING_OUTAGE']);
+});
+
+test('CATCH_UP_ON_START=1 processes commands sent before start-up', async () => {
+    const { bot, deliverQueued, handled } = makeBot({ config: { catchUpOnStart: true } });
+    deliverQueued(true, videoMessage({ id: 'CATCH_UP', ageSeconds: 60 }));
+    await bot.settle();
+    assert.deepEqual(handled, ['CATCH_UP']);
+});
+
+test('classifyMessage separates live, pre-start and reconnection deliveries', () => {
+    const message = videoMessage({ ageSeconds: 30 });
+    assert.equal(classifyMessage(message, baseConfig, { upsertType: 'notify', firstSession: true }).action, 'process');
+    assert.equal(classifyMessage(message, baseConfig, { upsertType: 'append', firstSession: true }).action, 'before-start');
+    assert.equal(classifyMessage(message, baseConfig, { upsertType: 'append', firstSession: false }).action, 'process');
 });
 
 test('a command in a chat with disappearing messages is processed', async () => {

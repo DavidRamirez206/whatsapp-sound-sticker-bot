@@ -282,7 +282,8 @@ La configuración se hace con variables de entorno. Lo más fácil es un archivo
 | `MAX_PARALLEL_JOBS` | `2` | Videos que se convierten a la vez. |
 | `REPLY_TO_MESSAGE` | `1` | Envía el sticker como respuesta al mensaje que lo pidió. |
 | `NOTIFY_ERRORS` | `1` | Responde con un texto corto cuando no se puede hacer el sticker (los problemas del propio video siempre se explican). |
-| `MAX_MESSAGE_AGE_SECONDS` | `600` | Los comandos más viejos que esto se omiten (queda en el log y se pide reenviarlo en el chat). Cubre los comandos enviados mientras el bot estaba desconectado. |
+| `CATCH_UP_ON_START` | `0` | Al iniciar, el bot solo escucha los mensajes nuevos. `1` también procesa los comandos enviados mientras no estaba corriendo. |
+| `MAX_MESSAGE_AGE_SECONDS` | `600` | Los comandos perdidos durante una reconexión se procesan si son más recientes que esto; los más viejos quedan en el log y se pide reenviarlos en el chat. |
 | `JOB_TIMEOUT_SECONDS` | `300` | Un trabajo que tarde más que esto se abandona y se informa, para que no bloquee la cola. |
 | `FFMPEG_TIMEOUT_SECONDS` | `180` | Cualquier proceso de FFmpeg/FFprobe que tarde más que esto se termina a la fuerza. |
 | `SESSION_DIR` | `whatsapp_session` | Carpeta con las credenciales de WhatsApp. |
@@ -359,8 +360,13 @@ El bot está pensado para correr días sin supervisión, así que nunca falla en
 - **Todo comando tiene un resultado.** Se procesa, o el chat recibe una explicación corta de por qué no
   (sin audio, video ilegible, tardó demasiado, problema de conexión), o queda en el log como `[SKIP]`
   porque es más viejo que `MAX_MESSAGE_AGE_SECONDS` y se pide en el chat que lo envíen de nuevo.
-- **Los comandos enviados mientras el bot estaba desconectado no se pierden.** WhatsApp los entrega al
-  reconectar y se procesan si son recientes (10 minutos por defecto).
+- **Arranca limpio, pero no pierde comandos en una caída.** Al iniciar, el bot solo escucha lo que llega
+  desde ese momento; los comandos enviados mientras no estaba corriendo se ignoran (quedan como `[SKIP]` en
+  el log, sin respuesta en el chat), salvo con `CATCH_UP_ON_START=1`. Si la conexión se cae mientras está
+  corriendo, WhatsApp entrega los comandos perdidos al reconectar y se procesan si son recientes (10 minutos
+  por defecto).
+- **Logs sin ruido.** Los videos de otras personas sin el comando no se registran; un video cuyo texto parece
+  un comando mal escrito (`! a`, `¡a`, `!A.`) sí, para que el error se note. Con `DEBUG=1` se registran todos.
 - **La conexión siempre vuelve.** Caídas, suspensión del equipo y cambios de red activan la reconexión con
   espera exponencial (hasta 60 s entre intentos), sin límite de intentos. Un watchdog reinicia la conexión
   si alguna vez queda caída sin nada pendiente. Solo se detiene cuando reintentar no sirve (sesión cerrada,
@@ -459,7 +465,7 @@ codificadores necesarios y publica los archivos junto con `SHA256SUMS.txt` en la
 | `Your FFmpeg build lacks the encoder(s)` | Tu FFmpeg es un build mínimo. Instala uno completo (`Gyan.FFmpeg` en Windows, RPM Fusion en Fedora). |
 | El QR no se puede leer | Agranda la terminal o usa Windows Terminal, o inicia sesión con `PAIRING_NUMBER`. |
 | `logged out` | El dispositivo se desvinculó desde el celular. Borra `whatsapp_session/` y vuelve a vincular. |
-| No pasa nada al enviar `!a` | El texto debe ser exactamente `!a` y el mensaje debe ser un video (no un GIF). Busca en la consola `[IN]` (recibido), `[SKIP]` (muy viejo) o `[ERR]` (falló, con la causa). Si no aparece ninguna línea, busca `[CONNECTION]`: el bot puede estar reconectando. |
+| No pasa nada al enviar `!a` | El texto debe ser exactamente `!a` y el mensaje debe ser un video (no un GIF). Busca en la consola `[IN]` (recibido), `[SKIP]` (enviado antes de iniciar el bot, o muy viejo) o `[ERR]` (falló, con la causa). Los comandos enviados con el bot apagado se ignoran a propósito; envíalos de nuevo. Si no aparece ninguna línea, busca `[CONNECTION]`: el bot puede estar reconectando. |
 | `closed: this session was opened somewhere else` | El bot está corriendo dos veces con la misma carpeta `whatsapp_session/`. Cierra la otra. |
 | `fetch failed` / `ETIMEDOUT` | Problema de red con los servidores de medios de WhatsApp. El bot reintenta solo; revisa tu conexión o firewall. |
 | El sticker llega sin sonido | La versión de WhatsApp de quien lo recibe quizá no soporta stickers con sonido (actualízala). Con `DEBUG=1`, usa `!t` para comparar codificaciones de audio. |

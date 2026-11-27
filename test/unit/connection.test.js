@@ -136,6 +136,23 @@ test('ignores events from sockets that were already replaced', async () => {
     }
 });
 
+test('deliveries say whether they belong to the first session after start-up', async () => {
+    const seen = [];
+    const { fake, connection } = await start({ onMessages: (event, sock, meta) => seen.push(meta.firstSession) });
+    try {
+        fake.sockets[0].ev.emit('messages.upsert', { messages: [], type: 'append' });
+        openSocket(fake.sockets[0]);
+        fake.sockets[0].ev.emit('messages.upsert', { messages: [], type: 'append' });
+        closeWith(fake.sockets[0], 428);
+        await waitUntil(() => fake.sockets.length === 2);
+        openSocket(fake.sockets[1]);
+        fake.sockets[1].ev.emit('messages.upsert', { messages: [], type: 'append' });
+        assert.deepEqual(seen, [true, true, false]);
+    } finally {
+        connection.stop();
+    }
+});
+
 test('a throwing message handler does not break later deliveries', async () => {
     let calls = 0;
     const { fake, connection } = await start({

@@ -8,8 +8,14 @@
  * - processed: the sticker is sent;
  * - failed: the reason is logged and a short explanation is sent to the chat;
  * - skipped: the command was older than `MAX_MESSAGE_AGE_SECONDS` (for example it
- *   was sent while the bot was offline for a long time); this is logged and the
- *   chat is asked to send it again.
+ *   was sent during a long connection outage); this is logged and the chat is
+ *   asked to send it again.
+ *
+ * Commands sent while the bot was not running at all are not processed when it
+ * starts: the bot listens to what arrives from that moment on. WhatsApp delivers
+ * those queued messages with the upsert type `append` on the first connection;
+ * they are logged and dropped (`CATCH_UP_ON_START=1` processes them instead).
+ * Commands queued during a reconnection while the bot was running are processed.
  *
  * Nothing is dropped silently, and one broken message or job can never stop
  * the bot from handling the next ones.
@@ -74,7 +80,22 @@ function messageAgeSeconds(message, nowMs = Date.now()) {
 }
 
 /**
+ * Whether a caption looks like a mistyped command (`! a`, `¡a`, `!A.`, `hola !a`),
+ * so it is worth logging why the video was ignored. Pure function.
+ *
+ * @param {string | null | undefined} caption
+ * @param {string} command
+ * @returns {boolean}
+ */
+function looksLikeCommandAttempt(caption, command) {
+    if (!caption) return false;
+    const compact = caption.toLowerCase().replace(/¡/g, '!').replace(/\s+/g, '');
+    return compact.includes(command);
+}
+
+/**
  * @typedef {{ action: 'ignore' }
+ *   | { action: 'before-start', command: { kind: string, video: any } }
  *   | { action: 'skip', command: { kind: string, video: any }, ageSeconds: number }
  *   | { action: 'process', command: { kind: 'sticker' | 'test', video: any } }} Classification
  */
@@ -86,13 +107,17 @@ function messageAgeSeconds(message, nowMs = Date.now()) {
  * differences, are processed: answering late is better than staying silent.
  *
  * @param {any} message
- * @param {{ command: string, testCommand: string, debug: boolean, maxMessageAgeSeconds: number }} config
- * @param {number} [nowMs]
+ * @param {{ command: string, testCommand: string, debug: boolean, maxMessageAgeSeconds: number, catchUpOnStart?: boolean }} config
+ * @param {object} [delivery]
+ * @param {string} [delivery.upsertType] `notify` for live messages, `append` for queued ones.
+ * @param {boolean} [delivery.firstSession] Whether it arrived on the first connection after start-up.
+ * @param {number} [delivery.nowMs]
  * @returns {Classification}
  */
-function classifyMessage(message, config, nowMs = Date.now()) {
+function classifyMessage(message, config, { upsertType = 'notify', firstSession = false, nowMs = Date.now() } = {}) {
     const command = parseCommand(message, config);
     if (!command) return { action: 'ignore' };
+    if (upsertType === 'append' && firstSession && !config.catchUpOnStart) return { action: 'before-start', command };
     const ageSeconds = messageAgeSeconds(message, nowMs);
     if (ageSeconds !== null && ageSeconds > config.maxMessageAgeSeconds) return { action: 'skip', command, ageSeconds };
     return { action: 'process', command };
@@ -186,16 +211,18 @@ function createBot(config, {
     const jobs = [];
 
     /**
-     * Logs recent videos that arrive without the command, so a wrong or missing
-     * caption is visible in the console instead of looking like a deaf bot.
+     * Logs live videos whose caption looks like a mistyped command, so the
+     * mistake is visible instead of looking like a deaf bot. With `DEBUG=1`
+     * every ignored video is logged.
      *
      * @param {any} message
+     * @param {{ upsertType: string, firstSession: boolean }} delivery
      */
-    function logIgnoredVideo(message) {
-        if (!videoOf(message.message)) return;
-        const age = messageAgeSeconds(message);
-        if (age !== null && age > config.maxMessageAgeSeconds) return;
-        log('IN', `video without the ${config.command} caption ignored | chat=${message.key.remoteJid}`);
+    function logIgnoredVideo(message, delivery) {
+        const video = videoOf(message.message);
+        if (!video || delivery.upsertType === 'append') return;
+        if (!config.debug && !looksLikeCommandAttempt(video.caption, config.command)) return;
+        log('IN', `video ignored: its caption is not ${config.command} | chat=${message.key.remoteJid}`);
     }
 
     /**
@@ -203,8 +230,9 @@ function createBot(config, {
      *
      * @param {any} message
      * @param {any} sock Socket that delivered it (used by debug tooling only).
+     * @param {{ upsertType: string, firstSession: boolean }} delivery
      */
-    function handleMessage(message, sock) {
+    function handleMessage(message, sock, delivery) {
         if (!message || !message.message || !message.key) return;
 
         const sticker = message.message.stickerMessage;
@@ -213,12 +241,17 @@ function createBot(config, {
                 .catch((error) => log('ERR', `analysing incoming sticker: ${describeError(error)}`));
         }
 
-        const result = classifyMessage(message, config);
+        const result = classifyMessage(message, config, delivery);
         if (result.action === 'ignore') {
-            logIgnoredVideo(message);
+            logIgnoredVideo(message, delivery);
             return;
         }
         if (!seen.add(message.key.id)) return;
+
+        if (result.action === 'before-start') {
+            log('SKIP', `${result.command.kind} command ${message.key.id} was sent before the bot started; ignored`);
+            return;
+        }
 
         const sender = message.key.fromMe ? 'me' : (message.key.participant || message.key.remoteJid);
         if (result.action === 'skip') {
@@ -243,10 +276,11 @@ function createBot(config, {
 
     const connection = connectionFactory({
         config,
-        onMessages: ({ messages }, sock) => {
+        onMessages: ({ messages, type }, sock, meta = {}) => {
+            const delivery = { upsertType: type || 'notify', firstSession: Boolean(meta.firstSession) };
             for (const message of messages || []) {
                 try {
-                    handleMessage(message, sock);
+                    handleMessage(message, sock, delivery);
                 } catch (error) {
                     log('ERR', `could not handle message ${message?.key?.id ?? '?'}: ${describeError(error)}`);
                 }
@@ -272,7 +306,8 @@ function createBot(config, {
 async function startBot(config) {
     const bot = createBot(config);
     log('CONFIG', `command ${config.command} | max ${config.maxSeconds}s | max frames ${config.maxFrames} | ` +
-        `audio ${config.audioKbps} kbps | lead ${config.audioLeadMs}ms | commands up to ${formatAge(config.maxMessageAgeSeconds)} old | ` +
+        `audio ${config.audioKbps} kbps | lead ${config.audioLeadMs}ms | ${config.catchUpOnStart ? 'catches up on start' : 'new commands only on start'} | ` +
+        `missed during reconnections up to ${formatAge(config.maxMessageAgeSeconds)} | ` +
         `job limit ${config.jobTimeoutMs / 1000}s | save files ${config.saveOutputs ? `yes (${config.outputsDir})` : 'no'} | ` +
         `debug ${config.debug ? 'yes' : 'no'}`);
     if (config.debug) log('CONFIG', `debug: ${config.testCommand} sends audio test variants; incoming sound stickers are analysed.`);
@@ -281,5 +316,5 @@ async function startBot(config) {
 }
 
 module.exports = {
-    startBot, createBot, runJob, classifyMessage, messageAgeSeconds, parseCommand, createSeenSet, videoOf
+    startBot, createBot, runJob, classifyMessage, looksLikeCommandAttempt, messageAgeSeconds, parseCommand, createSeenSet, videoOf
 };

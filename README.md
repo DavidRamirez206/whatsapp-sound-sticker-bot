@@ -282,7 +282,8 @@ Settings are environment variables. The easiest way is a `.env` file next to the
 | `MAX_PARALLEL_JOBS` | `2` | Videos converted at the same time. |
 | `REPLY_TO_MESSAGE` | `1` | Send the sticker as a reply to the request. |
 | `NOTIFY_ERRORS` | `1` | Reply with a short text when a sticker cannot be made (problems with the video itself are always explained). |
-| `MAX_MESSAGE_AGE_SECONDS` | `600` | Commands older than this are skipped (logged and answered with a request to send again). Covers commands sent while the bot was offline. |
+| `CATCH_UP_ON_START` | `0` | On start-up the bot only listens to new messages. `1` also processes commands sent while it was not running. |
+| `MAX_MESSAGE_AGE_SECONDS` | `600` | Commands missed during a reconnection are processed if they are younger than this; older ones are logged and answered with a request to send again. |
 | `JOB_TIMEOUT_SECONDS` | `300` | A job running longer than this is abandoned and reported, so it cannot block the queue. |
 | `FFMPEG_TIMEOUT_SECONDS` | `180` | Any single FFmpeg/FFprobe process running longer than this is killed. |
 | `SESSION_DIR` | `whatsapp_session` | Folder holding the WhatsApp credentials. |
@@ -357,8 +358,12 @@ The bot is meant to run unattended for days, so it never fails silently:
 - **Every command gets an outcome.** It is processed, or the chat receives a short explanation of
   why not (no audio, unreadable video, timeout, connection problem), or it is logged as `[SKIP]`
   because it is older than `MAX_MESSAGE_AGE_SECONDS` and the chat is asked to send it again.
-- **Commands sent while the bot was offline are not lost.** WhatsApp delivers them on reconnection
-  and they are processed if they are recent enough (10 minutes by default).
+- **It starts fresh, but does not lose commands during outages.** When the bot starts it only listens to
+  what arrives from then on; commands sent while it was not running are ignored (logged as `[SKIP]`, no
+  reply), unless `CATCH_UP_ON_START=1`. If the connection drops while it is running, WhatsApp delivers the
+  missed commands on reconnection and they are processed if they are recent enough (10 minutes by default).
+- **Quiet logs.** Videos from other people without the command are not logged; a video whose caption
+  looks like a mistyped command (`! a`, `¡a`, `!A.`) is, so the mistake is visible. `DEBUG=1` logs them all.
 - **The connection always comes back.** Drops, sleep/resume and network changes trigger reconnection
   with exponential back-off (up to 60 s between attempts), forever. A watchdog restarts the connection if
   it is ever left down with nothing pending. It stops only when retrying cannot help (logged out,
@@ -456,7 +461,7 @@ encoders, and publishes the archives plus `SHA256SUMS.txt` on the release page.
 | `Your FFmpeg build lacks the encoder(s)` | Your FFmpeg is a minimal build. Install a full build (`Gyan.FFmpeg` on Windows, RPM Fusion on Fedora). |
 | The QR code is unreadable | Make the terminal bigger or use Windows Terminal, or log in with `PAIRING_NUMBER`. |
 | `logged out` | The device was unlinked from the phone. Delete `whatsapp_session/` and link again. |
-| Nothing happens when sending `!a` | The caption must be exactly `!a` and the message must be a video (not a GIF). Look in the console for `[IN]` (received), `[SKIP]` (too old) or `[ERR]` (failed, with the cause). If there is no line at all, look for `[CONNECTION]`: the bot may be reconnecting. |
+| Nothing happens when sending `!a` | The caption must be exactly `!a` and the message must be a video (not a GIF). Look in the console for `[IN]` (received), `[SKIP]` (sent before the bot started, or too old) or `[ERR]` (failed, with the cause). Commands sent while the bot was off are ignored on purpose; send them again. If there is no line at all, look for `[CONNECTION]`: the bot may be reconnecting. |
 | `closed: this session was opened somewhere else` | The bot is running twice with the same `whatsapp_session/`. Close the other one. |
 | `fetch failed` / `ETIMEDOUT` | Network problem talking to WhatsApp's media servers. The bot retries automatically; check your connection or firewall. |
 | The sticker arrives without sound | The recipient's WhatsApp may not support stickers with sound yet (update it). With `DEBUG=1`, use `!t` to compare audio encodings. |

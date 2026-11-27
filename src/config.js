@@ -80,6 +80,7 @@ function loadConfig(env = process.env, cwd = process.cwd()) {
 
         maxParallelJobs: parseNumber(env.MAX_PARALLEL_JOBS, 2, { min: 1, max: 16 }),
         maxMessageAgeSeconds: parseNumber(env.MAX_MESSAGE_AGE_SECONDS, 600, { min: 30 }),
+        catchUpOnStart: parseFlag(env.CATCH_UP_ON_START, false),
         jobTimeoutMs: parseNumber(env.JOB_TIMEOUT_SECONDS, 300, { min: 30 }) * 1000,
         ffmpegTimeoutMs: parseNumber(env.FFMPEG_TIMEOUT_SECONDS, 180, { min: 10 }) * 1000,
         replyToMessage: parseFlag(env.REPLY_TO_MESSAGE, true),
