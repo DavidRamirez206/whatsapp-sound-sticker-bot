@@ -52,3 +52,12 @@ test('loadConfig reads overrides from the environment', () => {
     assert.equal(config.pairingNumber, '573001234567');
     assert.equal(config.sessionDir, path.resolve('/bot', 'my_session'));
 });
+
+test('session lock is on by default and the health file is optional', () => {
+    const config = loadConfig({}, '/work');
+    assert.equal(config.sessionLock, true);
+    assert.equal(config.healthFile, null);
+    const custom = loadConfig({ SESSION_LOCK: '0', HEALTH_FILE: 'state/health.json' }, '/work');
+    assert.equal(custom.sessionLock, false);
+    assert.equal(custom.healthFile, require('node:path').resolve('/work', 'state/health.json'));
+});

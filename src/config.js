@@ -87,6 +87,8 @@ function loadConfig(env = process.env, cwd = process.cwd()) {
         notifyErrors: parseFlag(env.NOTIFY_ERRORS, true),
 
         sessionDir: path.resolve(cwd, env.SESSION_DIR || 'whatsapp_session'),
+        sessionLock: parseFlag(env.SESSION_LOCK, true),
+        healthFile: env.HEALTH_FILE ? path.resolve(cwd, env.HEALTH_FILE) : null,
         pairingNumber: (env.PAIRING_NUMBER || '').replace(/\D/g, ''),
 
         saveOutputs: parseFlag(env.SAVE_OUTPUTS, false),

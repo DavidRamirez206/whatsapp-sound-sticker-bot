@@ -116,6 +116,7 @@ function createConnection({ config, onMessages, dependencies = {} }) {
     let reconnectTimer = null;
     let watchdog = null;
     let downSince = Date.now();
+    let openSince = null;
     /** @type {Array<{ resolve: (sock: any) => void, timer: NodeJS.Timeout }>} */
     let waiters = [];
 
@@ -169,6 +170,7 @@ function createConnection({ config, onMessages, dependencies = {} }) {
             const outage = everOpened && downForMs > 5000 ? ` (was offline ${Math.round(downForMs / 1000)}s)` : '';
             everOpened = true;
             if (firstSessionGeneration === null) firstSessionGeneration = socketGeneration;
+            openSince = Date.now();
             markOpen(socket);
             log('CONNECTION', `linked${outage}. ` +
                 `Send a video with the caption ${config.command} to get a sticker with sound.`);
@@ -273,6 +275,16 @@ function createConnection({ config, onMessages, dependencies = {} }) {
         stop,
         /** @returns {boolean} */
         get isOpen() { return open; },
+        /**
+         * Snapshot for health reporting.
+         *
+         * @returns {{ state: 'open' | 'connecting' | 'stopped', since: number, everOpened: boolean }}
+         */
+        get status() {
+            if (stopped) return { state: 'stopped', since: downSince, everOpened };
+            if (open) return { state: 'open', since: openSince, everOpened };
+            return { state: 'connecting', since: downSince, everOpened };
+        },
         /** @returns {any} The current socket, possibly not connected. */
         get socket() { return sock; },
 

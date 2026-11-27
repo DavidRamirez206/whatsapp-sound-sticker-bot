@@ -14,6 +14,8 @@ const { assertFfmpegReady, setProcessTimeout } = require('./media/ffmpeg');
 const { installStickerAudioPatch } = require('./sticker-audio-patch');
 const { installDecodeInspector } = require('./whatsapp/inspect');
 const { startBot } = require('./bot');
+const { startHealthReporter } = require('./health');
+const { acquireSessionLock } = require('./session-lock');
 
 /**
  * Last line of defence. Errors that escape every handler are logged with their
@@ -41,18 +43,22 @@ function installProcessHandlers() {
 }
 
 /**
- * Closes the WhatsApp connection on Ctrl+C or a service stop, so the session
- * files are not left half-written.
+ * Closes the WhatsApp connection on Ctrl+C or a service stop (including
+ * `docker stop`), so the session files are not left half-written.
  *
  * @param {{ stop: () => void }} bot
+ * @param {Array<() => void>} cleanups Run after the bot stops (health file, session lock).
  */
-function installShutdown(bot) {
+function installShutdown(bot, cleanups) {
     let closing = false;
     const shutdown = (signal) => {
         if (closing) return;
         closing = true;
         log('STOP', `${signal} received, closing the connection`);
         try { bot.stop(); } catch (error) { log('ERR', `while stopping: ${describeError(error)}`); }
+        for (const cleanup of cleanups) {
+            try { cleanup(); } catch (error) { log('ERR', `while cleaning up: ${describeError(error)}`); }
+        }
         setTimeout(() => process.exit(0), 500).unref();
     };
     process.once('SIGINT', () => shutdown('SIGINT'));
@@ -75,8 +81,15 @@ async function main() {
     installStickerAudioPatch(proto);
     if (config.debug) installDecodeInspector(proto, config.command);
 
+    const cleanups = [];
+    if (config.sessionLock) cleanups.push(acquireSessionLock(config.sessionDir).release);
+
     const bot = await startBot(config);
-    installShutdown(bot);
+    if (config.healthFile) {
+        const reporter = startHealthReporter({ file: config.healthFile, getStatus: () => bot.connection.status });
+        cleanups.unshift(reporter.stop);
+    }
+    installShutdown(bot, cleanups);
 }
 
 module.exports = { main };

@@ -153,6 +153,17 @@ test('deliveries say whether they belong to the first session after start-up', a
     }
 });
 
+test('status reports connecting, open and stopped', async () => {
+    const { fake, connection } = await start();
+    assert.equal(connection.status.state, 'connecting');
+    assert.equal(connection.status.everOpened, false);
+    openSocket(fake.sockets[0]);
+    assert.equal(connection.status.state, 'open');
+    assert.equal(connection.status.everOpened, true);
+    connection.stop();
+    assert.equal(connection.status.state, 'stopped');
+});
+
 test('a throwing message handler does not break later deliveries', async () => {
     let calls = 0;
     const { fake, connection } = await start({
