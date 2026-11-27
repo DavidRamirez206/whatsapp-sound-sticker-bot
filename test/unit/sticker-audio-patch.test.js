@@ -47,6 +47,18 @@ test('other stickers are left untouched', () => {
         'after detaching, the sticker is encoded without audio');
 });
 
+test('the audio is still embedded when WhatsApp asks to resend the sticker', () => {
+    const audio = audioBytes();
+    attachAudio(sha, audio);
+    try {
+        encodeSticker(sha);
+        const resent = findBytesField(parseRawFields(encodeSticker(sha)), STICKER_AUDIO_FIELD);
+        assert.ok(resent, 'a second encoding (resend) must carry the audio too');
+    } finally {
+        detachAudio(sha);
+    }
+});
+
 test('installing the patch twice does not embed the audio twice', () => {
     installStickerAudioPatch(proto);
     attachAudio(sha, audioBytes());

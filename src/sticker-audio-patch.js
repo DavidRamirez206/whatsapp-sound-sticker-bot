@@ -11,9 +11,15 @@
  * The audio to attach is looked up by the sticker's `fileSha256`, so only the
  * sticker that was explicitly registered gets the extra field; every other
  * sticker the library encodes is left untouched.
+ *
+ * Registrations are kept for an hour instead of being dropped right after the
+ * first send: when a recipient's phone fails to decrypt a message, WhatsApp asks
+ * the sender to encrypt it again, and that second encoding must carry the audio
+ * too, or the resent sticker arrives muted.
  */
 
 const { log } = require('./logger');
+const { createTtlCache } = require('./ttl-cache');
 
 /** Field number of the embedded audio inside `StickerMessage`. */
 const STICKER_AUDIO_FIELD = 26;
@@ -23,8 +29,11 @@ const STICKER_AUDIO_TAG = (STICKER_AUDIO_FIELD << 3) | 2;
 
 const PATCHED = Symbol.for('sound-sticker-bot.encode-patched');
 
-/** @type {Map<string, Uint8Array>} fileSha256 (base64) -> encoded AudioMessage */
-const pendingAudio = new Map();
+/** How long an audio stays attached to its sticker (covers WhatsApp's resend requests). */
+const AUDIO_TTL_MS = 60 * 60 * 1000;
+
+/** fileSha256 (base64) -> encoded AudioMessage */
+const pendingAudio = createTtlCache({ maxEntries: 200, ttlMs: AUDIO_TTL_MS });
 
 /** @param {Uint8Array} fileSha256 */
 const keyOf = (fileSha256) => Buffer.from(fileSha256).toString('base64');
@@ -41,7 +50,7 @@ function attachAudio(fileSha256, audioMessageBytes) {
 
 /** @param {Uint8Array} fileSha256 */
 function detachAudio(fileSha256) {
-    pendingAudio.delete(keyOf(fileSha256));
+    pendingAudio.del(keyOf(fileSha256));
 }
 
 /**
@@ -70,4 +79,4 @@ function installStickerAudioPatch(proto) {
     StickerMessage.encode = patchedEncode;
 }
 
-module.exports = { STICKER_AUDIO_FIELD, STICKER_AUDIO_TAG, attachAudio, detachAudio, installStickerAudioPatch };
+module.exports = { AUDIO_TTL_MS, STICKER_AUDIO_FIELD, STICKER_AUDIO_TAG, attachAudio, detachAudio, installStickerAudioPatch };
