@@ -29,6 +29,7 @@ antes de usarlo.
 - [Uso](#uso)
 - [Configuración](#configuración)
 - [Cómo se codifican los videos largos](#cómo-se-codifican-los-videos-largos)
+- [Confiabilidad](#confiabilidad)
 - [Estructura del proyecto](#estructura-del-proyecto)
 - [Pruebas](#pruebas)
 - [Compilar el ejecutable y publicar versiones](#compilar-el-ejecutable-y-publicar-versiones)
@@ -280,6 +281,10 @@ La configuración se hace con variables de entorno. Lo más fácil es un archivo
 | `AUDIO_LEAD_MS` | `100` | Milisegundos que se saltan al inicio del audio para compensar el retraso de WhatsApp al reproducirlo. Súbelo si el sonido va atrasado; bájalo o ponlo en `0` si va adelantado. |
 | `MAX_PARALLEL_JOBS` | `2` | Videos que se convierten a la vez. |
 | `REPLY_TO_MESSAGE` | `1` | Envía el sticker como respuesta al mensaje que lo pidió. |
+| `NOTIFY_ERRORS` | `1` | Responde con un texto corto cuando no se puede hacer el sticker (los problemas del propio video siempre se explican). |
+| `MAX_MESSAGE_AGE_SECONDS` | `600` | Los comandos más viejos que esto se omiten (queda en el log y se pide reenviarlo en el chat). Cubre los comandos enviados mientras el bot estaba desconectado. |
+| `JOB_TIMEOUT_SECONDS` | `300` | Un trabajo que tarde más que esto se abandona y se informa, para que no bloquee la cola. |
+| `FFMPEG_TIMEOUT_SECONDS` | `180` | Cualquier proceso de FFmpeg/FFprobe que tarde más que esto se termina a la fuerza. |
 | `SESSION_DIR` | `whatsapp_session` | Carpeta con las credenciales de WhatsApp. |
 | `PAIRING_NUMBER` | *(vacío)* | Número (dígitos, con código de país) para iniciar sesión con código de vinculación en vez de QR. |
 | `SAVE_OUTPUTS` | `0` | `1` guarda cada video recibido y los archivos generados en `OUTPUTS_DIR`. Desactivado por privacidad. |
@@ -347,6 +352,34 @@ detalle y movimiento de 20 s o más simplemente no admiten más de ~5 fps en 500
 
 ---
 
+## Confiabilidad
+
+El bot está pensado para correr días sin supervisión, así que nunca falla en silencio:
+
+- **Todo comando tiene un resultado.** Se procesa, o el chat recibe una explicación corta de por qué no
+  (sin audio, video ilegible, tardó demasiado, problema de conexión), o queda en el log como `[SKIP]`
+  porque es más viejo que `MAX_MESSAGE_AGE_SECONDS` y se pide en el chat que lo envíen de nuevo.
+- **Los comandos enviados mientras el bot estaba desconectado no se pierden.** WhatsApp los entrega al
+  reconectar y se procesan si son recientes (10 minutos por defecto).
+- **La conexión siempre vuelve.** Caídas, suspensión del equipo y cambios de red activan la reconexión con
+  espera exponencial (hasta 60 s entre intentos), sin límite de intentos. Un watchdog reinicia la conexión
+  si alguna vez queda caída sin nada pendiente. Solo se detiene cuando reintentar no sirve (sesión cerrada,
+  la misma sesión abierta en otra instancia, cuenta bloqueada) y el log dice qué hacer.
+- **Nada puede colgar el bot.** Descargas, subidas y envíos tienen límite de tiempo y reintentos, y siempre
+  usan la conexión actual; los procesos de FFmpeg se terminan después de `FFMPEG_TIMEOUT_SECONDS`; un
+  trabajo completo se abandona después de `JOB_TIMEOUT_SECONDS` y libera su lugar en la cola.
+- **Los reenvíos siguen funcionando.** Cuando un celular no puede descifrar el sticker, WhatsApp le pide al
+  bot que lo envíe otra vez; los mensajes recientes y su audio se guardan una hora, incluso entre
+  reconexiones, así que el sticker reenviado sigue teniendo sonido.
+- **Los errores quedan contenidos.** Un mensaje dañado, un trabajo que falla o una excepción inesperada se
+  registran con su causa y el bot sigue atendiendo los siguientes. Ctrl+C o detener el servicio cierra la
+  sesión de forma limpia.
+- El bot no marca la cuenta como "en línea", así tu celular sigue recibiendo notificaciones.
+
+Estos comportamientos están cubiertos por pruebas en `test/unit/connection.test.js` y `test/unit/bot.test.js`.
+
+---
+
 ## Estructura del proyecto
 
 ```text
@@ -354,10 +387,12 @@ index.js                      Punto de entrada (manejo de errores fatales)
 src/
 ├── main.js                   Arranque: configuración, chequeo de FFmpeg, parches del protocolo
 ├── config.js                 Lectura de variables de entorno / .env
-├── bot.js                    Conexión a WhatsApp, login, reconexión y enrutamiento de mensajes
+├── bot.js                    Enrutamiento de mensajes y ejecución de trabajos (todo comando tiene resultado)
 ├── handlers.js               Comando de sticker y comando de prueba (debug)
+├── errors.js                 Errores para el usuario y explicaciones en el chat
 ├── queue.js                  Cola de trabajos con límite de concurrencia
-├── retry.js                  Pasos cronometrados con reintentos ante errores de red
+├── retry.js                  Pasos cronometrados con límites de tiempo y reintentos
+├── ttl-cache.js              Caché acotada con expiración
 ├── workdir.js                Carpetas de trabajo temporales / guardadas
 ├── logger.js                 Registro en consola (oculta los volcados de sesiones Signal)
 ├── protobuf.js               Lector de protobuf sin esquema
@@ -370,6 +405,7 @@ src/
 │   ├── webp.js               Lector del contenedor WebP
 │   └── validate.js           Validación antes de enviar
 └── whatsapp/
+    ├── connection.js         Conexión resiliente: login, reconexión con espera, watchdog
     ├── send.js               Subida y envío del sticker con sonido
     ├── verify.js             Verificación opcional volviendo a descargar
     └── inspect.js            Debug: análisis de stickers con sonido entrantes
@@ -423,7 +459,8 @@ codificadores necesarios y publica los archivos junto con `SHA256SUMS.txt` en la
 | `Your FFmpeg build lacks the encoder(s)` | Tu FFmpeg es un build mínimo. Instala uno completo (`Gyan.FFmpeg` en Windows, RPM Fusion en Fedora). |
 | El QR no se puede leer | Agranda la terminal o usa Windows Terminal, o inicia sesión con `PAIRING_NUMBER`. |
 | `logged out` | El dispositivo se desvinculó desde el celular. Borra `whatsapp_session/` y vuelve a vincular. |
-| No pasa nada al enviar `!a` | El texto debe ser exactamente `!a` y el mensaje debe ser un video (no un GIF). Busca `[IN]` en la consola. Se ignoran los mensajes de más de 2 minutos. |
+| No pasa nada al enviar `!a` | El texto debe ser exactamente `!a` y el mensaje debe ser un video (no un GIF). Busca en la consola `[IN]` (recibido), `[SKIP]` (muy viejo) o `[ERR]` (falló, con la causa). Si no aparece ninguna línea, busca `[CONNECTION]`: el bot puede estar reconectando. |
+| `closed: this session was opened somewhere else` | El bot está corriendo dos veces con la misma carpeta `whatsapp_session/`. Cierra la otra. |
 | `fetch failed` / `ETIMEDOUT` | Problema de red con los servidores de medios de WhatsApp. El bot reintenta solo; revisa tu conexión o firewall. |
 | El sticker llega sin sonido | La versión de WhatsApp de quien lo recibe quizá no soporta stickers con sonido (actualízala). Con `DEBUG=1`, usa `!t` para comparar codificaciones de audio. |
 | El sonido va desfasado | Ajusta `AUDIO_LEAD_MS` (por ejemplo `0`, `100`, `200`). |
