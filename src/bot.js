@@ -1,29 +1,31 @@
 'use strict';
 
 /**
- * WhatsApp connection and message routing.
+ * Message routing and job execution.
  *
- * The bot logs in as a linked device of a normal WhatsApp account (the same
- * mechanism as WhatsApp Web), keeps its credentials in `SESSION_DIR`, reconnects
- * automatically and dispatches commands to the handlers through a bounded queue.
+ * Every command that reaches the bot ends in exactly one visible outcome:
+ *
+ * - processed: the sticker is sent;
+ * - failed: the reason is logged and a short explanation is sent to the chat;
+ * - skipped: the command was older than `MAX_MESSAGE_AGE_SECONDS` (for example it
+ *   was sent while the bot was offline for a long time); this is logged and the
+ *   chat is asked to send it again.
+ *
+ * Nothing is dropped silently, and one broken message or job can never stop
+ * the bot from handling the next ones.
  */
 
-const pino = require('pino');
-const qrcode = require('qrcode-terminal');
-const {
-    default: makeWASocket,
-    useMultiFileAuthState,
-    fetchLatestBaileysVersion,
-    DisconnectReason
-} = require('@whiskeysockets/baileys');
 const { log, formatKb } = require('./logger');
-const { describeError } = require('./retry');
+const { describeError, withTimeout } = require('./retry');
 const { createQueue } = require('./queue');
+const { UserError, userMessageFor } = require('./errors');
 const { handleStickerCommand, handleTestCommand } = require('./handlers');
 const { analyzeIncomingSticker } = require('./whatsapp/inspect');
+const { createConnection } = require('./whatsapp/connection');
+const { sendText } = require('./whatsapp/send');
 
 /** How many processed message ids are remembered to ignore duplicates. */
-const SEEN_IDS_LIMIT = 500;
+const SEEN_IDS_LIMIT = 1000;
 
 /**
  * Returns the video payload of a message, whether it was sent as a regular
@@ -53,15 +55,43 @@ function parseCommand(message, config) {
 }
 
 /**
- * Whether a message is recent. On reconnection WhatsApp replays history; old
- * commands must not be processed again.
+ * Seconds since the message was sent, or `null` when it carries no usable
+ * timestamp. Accepts numbers and protobuf `Long` values.
  *
  * @param {any} message
- * @param {number} maxAgeSeconds
  * @param {number} [nowMs]
+ * @returns {number | null}
  */
-function isFresh(message, maxAgeSeconds, nowMs = Date.now()) {
-    return nowMs / 1000 - Number(message.messageTimestamp || 0) <= maxAgeSeconds;
+function messageAgeSeconds(message, nowMs = Date.now()) {
+    const raw = message && message.messageTimestamp;
+    const seconds = raw && typeof raw === 'object' && typeof raw.toNumber === 'function' ? raw.toNumber() : Number(raw);
+    if (!Number.isFinite(seconds) || seconds <= 0) return null;
+    return nowMs / 1000 - seconds;
+}
+
+/**
+ * @typedef {{ action: 'ignore' }
+ *   | { action: 'skip', command: { kind: string, video: any }, ageSeconds: number }
+ *   | { action: 'process', command: { kind: 'sticker' | 'test', video: any } }} Classification
+ */
+
+/**
+ * Classifies an incoming message. Pure function.
+ *
+ * Messages without a usable timestamp, or dated in the future because of clock
+ * differences, are processed: answering late is better than staying silent.
+ *
+ * @param {any} message
+ * @param {{ command: string, testCommand: string, debug: boolean, maxMessageAgeSeconds: number }} config
+ * @param {number} [nowMs]
+ * @returns {Classification}
+ */
+function classifyMessage(message, config, nowMs = Date.now()) {
+    const command = parseCommand(message, config);
+    if (!command) return { action: 'ignore' };
+    const ageSeconds = messageAgeSeconds(message, nowMs);
+    if (ageSeconds !== null && ageSeconds > config.maxMessageAgeSeconds) return { action: 'skip', command, ageSeconds };
+    return { action: 'process', command };
 }
 
 /**
@@ -82,91 +112,153 @@ function createSeenSet(limit) {
     };
 }
 
+/** @param {number} seconds */
+const formatAge = (seconds) => (seconds >= 120 ? `${Math.round(seconds / 60)} min` : `${Math.round(seconds)}s`);
+
+/**
+ * Sends `text` to the chat of `message`; failures are logged, never thrown.
+ *
+ * @param {(connection: any, chat: string, text: string, quoted?: any) => Promise<any>} reply
+ */
+async function tellChat(reply, connection, message, text) {
+    try {
+        await reply(connection, message.key.remoteJid, text, message);
+    } catch (error) {
+        log('ERR', `could not send a message to ${message.key.remoteJid}: ${describeError(error)}`);
+    }
+}
+
+/**
+ * Runs one command handler with a time limit and turns any failure into a log
+ * line and, when allowed, a reply. Never throws.
+ *
+ * @param {object} context
+ * @param {any} context.connection
+ * @param {ReturnType<typeof import('./config').loadConfig>} context.config
+ * @param {(connection: any, chat: string, text: string, quoted?: any) => Promise<any>} [context.reply]
+ * @param {(context: any, message: any, video: any) => Promise<void>} handler
+ * @param {any} message
+ * @param {{ kind: string, video: any }} command
+ * @returns {Promise<'done' | 'rejected' | 'failed'>}
+ */
+async function runJob({ connection, config, reply = sendText }, handler, message, command) {
+    const id = message.key.id;
+    try {
+        await withTimeout(Promise.resolve().then(() => handler({ connection, config }, message, command.video)),
+            config.jobTimeoutMs, `${command.kind} job ${id}`);
+        return 'done';
+    } catch (error) {
+        if (error instanceof UserError) {
+            log('OUT', `rejected ${id}: ${error.message}`);
+            await tellChat(reply, connection, message, error.message);
+            return 'rejected';
+        }
+        log('ERR', `failed processing ${id} at step "${error && error.step ? error.step : '?'}": ${describeError(error)}` +
+            `${error && error.stack ? `\n${error.stack}` : ''}`);
+        if (config.notifyErrors) await tellChat(reply, connection, message, userMessageFor(error));
+        return 'failed';
+    }
+}
+
+/**
+ * Wires the connection, the queue and the handlers together.
+ *
+ * @param {ReturnType<typeof import('./config').loadConfig>} config
+ * @param {object} [dependencies] Injectable for tests.
+ * @param {typeof createConnection} [dependencies.connectionFactory]
+ * @param {{ sticker: Function, test: Function }} [dependencies.handlers]
+ * @param {typeof sendText} [dependencies.reply]
+ */
+function createBot(config, {
+    connectionFactory = createConnection,
+    handlers = { sticker: handleStickerCommand, test: handleTestCommand },
+    reply = sendText
+} = {}) {
+    const queue = createQueue(config.maxParallelJobs, {
+        onQueued: (pending) => log('QUEUE', `waiting (${pending} pending)`)
+    });
+    const seen = createSeenSet(SEEN_IDS_LIMIT);
+    /** @type {Promise<string>[]} */
+    const jobs = [];
+
+    /**
+     * Handles one incoming message. Errors stay inside this message.
+     *
+     * @param {any} message
+     * @param {any} sock Socket that delivered it (used by debug tooling only).
+     */
+    function handleMessage(message, sock) {
+        if (!message || !message.message || !message.key) return;
+
+        const sticker = message.message.stickerMessage;
+        if (config.debug && sticker && sticker.fileSha256 && sock) {
+            analyzeIncomingSticker(sock, message, sticker)
+                .catch((error) => log('ERR', `analysing incoming sticker: ${describeError(error)}`));
+        }
+
+        const result = classifyMessage(message, config);
+        if (result.action === 'ignore' || !seen.add(message.key.id)) return;
+
+        const sender = message.key.fromMe ? 'me' : (message.key.participant || message.key.remoteJid);
+        if (result.action === 'skip') {
+            log('SKIP', `${result.command.kind} command ${message.key.id} from ${sender} ignored: sent ` +
+                `${formatAge(result.ageSeconds)} ago (limit ${formatAge(config.maxMessageAgeSeconds)})`);
+            if (config.notifyErrors) {
+                jobs.push(tellChat(reply, connection, message,
+                    'I was offline when you sent this video. Please send it again.').then(() => 'skipped'));
+            }
+            return;
+        }
+
+        const { command } = result;
+        const { video } = command;
+        log('IN', `${command.kind} command | chat=${message.key.remoteJid} | from=${sender} | ` +
+            `video=${video.seconds ?? '?'}s ${formatKb(Number(video.fileLength || 0))} ${video.width ?? '?'}x${video.height ?? '?'}`);
+
+        const handler = command.kind === 'test' ? handlers.test : handlers.sticker;
+        jobs.push(queue.run(() => runJob({ connection, config, reply }, handler, message, command)));
+        if (jobs.length > 100) jobs.splice(0, jobs.length - 100);
+    }
+
+    const connection = connectionFactory({
+        config,
+        onMessages: ({ messages }, sock) => {
+            for (const message of messages || []) {
+                try {
+                    handleMessage(message, sock);
+                } catch (error) {
+                    log('ERR', `could not handle message ${message?.key?.id ?? '?'}: ${describeError(error)}`);
+                }
+            }
+        }
+    });
+
+    return {
+        connection,
+        queue,
+        start: () => connection.start(),
+        stop: () => connection.stop(),
+        /** Waits for every job started so far (used by tests and shutdown). */
+        settle: () => Promise.all(jobs)
+    };
+}
+
 /**
  * Connects to WhatsApp and starts handling messages.
  *
  * @param {ReturnType<typeof import('./config').loadConfig>} config
  */
 async function startBot(config) {
-    const queue = createQueue(config.maxParallelJobs, {
-        onQueued: (pending) => log('QUEUE', `waiting (${pending} pending)`)
-    });
-    const seen = createSeenSet(SEEN_IDS_LIMIT);
-
-    const connect = async () => {
-        const { state, saveCreds } = await useMultiFileAuthState(config.sessionDir);
-        const { version } = await fetchLatestBaileysVersion();
-        const sock = makeWASocket({
-            version,
-            auth: state,
-            logger: pino({ level: 'silent' }),
-            browser: ['Ubuntu', 'Chrome', '20.0.04']
-        });
-        let pairingRequested = false;
-
-        sock.ev.on('creds.update', saveCreds);
-
-        sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
-            if (qr && config.pairingNumber && !pairingRequested) {
-                pairingRequested = true;
-                try {
-                    const code = await sock.requestPairingCode(config.pairingNumber);
-                    log('LOGIN', `Pairing code: ${code}`);
-                    log('LOGIN', 'WhatsApp > Linked devices > Link a device > Link with phone number instead, then type the code.');
-                } catch (error) {
-                    log('ERR', `could not request a pairing code: ${describeError(error)}`);
-                }
-            } else if (qr && !config.pairingNumber) {
-                console.clear();
-                console.log('Scan this QR code with WhatsApp (Settings > Linked devices > Link a device):');
-                qrcode.generate(qr, { small: true });
-            }
-
-            if (connection === 'close') {
-                const status = lastDisconnect?.error?.output?.statusCode;
-                log('CONNECTION', `closed (code ${status})`);
-                if (status === DisconnectReason.loggedOut) {
-                    log('CONNECTION', `logged out. Delete the "${config.sessionDir}" folder and start again to link a new session.`);
-                    return;
-                }
-                log('CONNECTION', 'reconnecting...');
-                connect().catch((error) => log('ERR', `reconnection failed: ${describeError(error)}`));
-            } else if (connection === 'open') {
-                log('CONNECTION', `linked. Send a video with the caption ${config.command} to get a sticker with sound.`);
-                log('CONFIG', `max ${config.maxSeconds}s | max frames ${config.maxFrames} | audio ${config.audioKbps} kbps | ` +
-                    `audio lead ${config.audioLeadMs}ms | reply ${config.replyToMessage ? 'yes' : 'no'} | ` +
-                    `save files ${config.saveOutputs ? `yes (${config.outputsDir})` : 'no'} | debug ${config.debug ? 'yes' : 'no'}`);
-                if (config.debug) log('CONFIG', `debug: ${config.testCommand} sends audio test variants; incoming sound stickers are analysed.`);
-            }
-        });
-
-        sock.ev.on('messages.upsert', ({ messages }) => {
-            for (const message of messages) {
-                if (!message || !message.message || !isFresh(message, config.maxMessageAgeSeconds)) continue;
-
-                const sticker = message.message.stickerMessage;
-                if (config.debug && sticker && sticker.fileSha256) {
-                    analyzeIncomingSticker(sock, message, sticker)
-                        .catch((error) => log('ERR', `analysing incoming sticker: ${describeError(error)}`));
-                }
-
-                const command = parseCommand(message, config);
-                if (!command || !seen.add(message.key.id)) continue;
-
-                const { video } = command;
-                const sender = message.key.fromMe ? 'me' : (message.key.participant || message.key.remoteJid);
-                log('IN', `${command.kind} command | chat=${message.key.remoteJid} | from=${sender} | ` +
-                    `video=${video.seconds ?? '?'}s ${formatKb(Number(video.fileLength || 0))} ${video.width ?? '?'}x${video.height ?? '?'}`);
-
-                const handler = command.kind === 'test' ? handleTestCommand : handleStickerCommand;
-                queue.run(() => handler({ sock, config }, message, video))
-                    .catch((error) => log('ERR', `failed processing ${message.key.id} at step "${error.step || '?'}": ` +
-                        `${describeError(error)}\n${error.stack || ''}`));
-            }
-        });
-    };
-
-    await connect();
+    const bot = createBot(config);
+    log('CONFIG', `command ${config.command} | max ${config.maxSeconds}s | max frames ${config.maxFrames} | ` +
+        `audio ${config.audioKbps} kbps | lead ${config.audioLeadMs}ms | commands up to ${formatAge(config.maxMessageAgeSeconds)} old | ` +
+        `job limit ${config.jobTimeoutMs / 1000}s | save files ${config.saveOutputs ? `yes (${config.outputsDir})` : 'no'} | ` +
+        `debug ${config.debug ? 'yes' : 'no'}`);
+    if (config.debug) log('CONFIG', `debug: ${config.testCommand} sends audio test variants; incoming sound stickers are analysed.`);
+    await bot.start();
+    return bot;
 }
 
-module.exports = { startBot, parseCommand, isFresh, createSeenSet, videoOf };
+module.exports = {
+    startBot, createBot, runJob, classifyMessage, messageAgeSeconds, parseCommand, createSeenSet, videoOf
+};

@@ -3,6 +3,11 @@
 /**
  * Command handlers: turn a received video into one sound sticker (main command)
  * or into several variants that differ only in audio encoding (test command).
+ *
+ * Handlers only throw; they never report failures to the chat themselves. The
+ * job runner in `bot.js` turns every error into a log line and a reply, so no
+ * failure can go unnoticed. Problems caused by the request itself are thrown as
+ * {@link UserError} with a message meant for the person who sent it.
  */
 
 const fs = require('node:fs');
@@ -17,10 +22,19 @@ const { convertToSticker } = require('./media/sticker');
 const { extractAudio } = require('./media/audio');
 const { parseWebp } = require('./media/webp');
 const { validateOutputs } = require('./media/validate');
-const { sendSoundSticker } = require('./whatsapp/send');
+const { sendSoundSticker, sendText, CONNECTION_WAIT_MS } = require('./whatsapp/send');
+const { UserError } = require('./errors');
 const { verifyUpload } = require('./whatsapp/verify');
 
 /** Audio variants sent by the test command. */
+const DOWNLOAD_STEP = Object.freeze({ retries: 3, timeoutMs: 90_000 });
+
+/**
+ * @typedef {object} JobContext
+ * @property {ReturnType<typeof import('./whatsapp/connection').createConnection>} connection
+ * @property {ReturnType<typeof import('./config').loadConfig>} config
+ */
+
 const TEST_VARIANTS = Object.freeze([
     { mode: 'direct', label: 'direct conversion' },
     { mode: 'clean', label: 'timestamps reset, no metadata' },
@@ -42,18 +56,29 @@ function clipDuration(probedDuration, declaredSeconds, maxSeconds) {
 }
 
 /**
- * Downloads the video of `message` into `file` and probes it.
+ * Downloads the video of `message` into `file`, probes it and rejects videos
+ * without sound.
  *
- * @param {any} sock
+ * @param {JobContext['connection']} connection
  * @param {any} message
  * @param {string} file
  */
-async function downloadAndProbe(sock, message, file) {
-    const data = await runStep('download video', () => downloadMediaMessage(message, 'buffer', {},
-        { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }), { retries: 3 });
+async function downloadAndProbe(connection, message, file) {
+    const data = await runStep('download video', async () => {
+        const sock = await connection.waitForOpen(CONNECTION_WAIT_MS);
+        return downloadMediaMessage(message, 'buffer', {},
+            { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage });
+    }, DOWNLOAD_STEP);
     fs.writeFileSync(file, /** @type {Buffer} */ (data));
-    const info = await runStep('probe video', () => probeVideo(file));
+
+    let info;
+    try {
+        info = await runStep('probe video', () => probeVideo(file));
+    } catch {
+        throw new UserError('Sorry, I could not read that video. Try sending it again, or another one.');
+    }
     log('VIDEO', `${describeVideo(info)} | duration=${info.duration ? `${info.duration.toFixed(2)}s` : '?'}`);
+    if (!info.hasAudio) throw new UserError('That video has no audio, so it cannot become a sticker with sound.');
     return info;
 }
 
@@ -83,11 +108,11 @@ async function syncAudioToAnimation(video, webp, ogg, requestedDuration, config)
 /**
  * Main command: video -> sticker with sound, sent as a reply to the request.
  *
- * @param {{ sock: any, config: any }} context
+ * @param {JobContext} context
  * @param {any} message Incoming `WAMessage`.
  * @param {any} videoMessage Its video payload.
  */
-async function handleStickerCommand({ sock, config }, message, videoMessage) {
+async function handleStickerCommand({ connection, config }, message, videoMessage) {
     const startedAt = Date.now();
     const chat = message.key.remoteJid;
     const work = createWorkDir(config);
@@ -96,14 +121,7 @@ async function handleStickerCommand({ sock, config }, message, videoMessage) {
     const ogg = path.join(work.dir, 'audio.ogg');
 
     try {
-        const info = await downloadAndProbe(sock, message, video);
-        if (!info.hasAudio) {
-            await sock.sendMessage(chat, { text: 'That video has no audio, so it cannot become a sticker with sound.' },
-                { quoted: message });
-            log('OUT', `rejected: video without audio | chat=${chat}`);
-            return;
-        }
-
+        const info = await downloadAndProbe(connection, message, video);
         const duration = clipDuration(info.duration, videoMessage.seconds, config.maxSeconds);
         const convertStartedAt = Date.now();
         const [sticker] = await runStep('convert (ffmpeg)', () => Promise.all([
@@ -116,7 +134,7 @@ async function handleStickerCommand({ sock, config }, message, videoMessage) {
         await validateOutputs(webp, ogg, finalDuration, config.maxStickerBytes);
 
         const sendStartedAt = Date.now();
-        const uploaded = await sendSoundSticker(sock, chat, {
+        const uploaded = await sendSoundSticker(connection, chat, {
             webpPath: webp,
             oggPath: ogg,
             seconds: Math.max(1, Math.round(finalDuration)),
@@ -142,35 +160,30 @@ async function handleStickerCommand({ sock, config }, message, videoMessage) {
  * the same animation; only the audio encoding changes. Useful to find out which
  * encoding a given phone/client plays.
  *
- * @param {{ sock: any, config: any }} context
+ * @param {JobContext} context
  * @param {any} message
  * @param {any} videoMessage
  */
-async function handleTestCommand({ sock, config }, message, videoMessage) {
+async function handleTestCommand({ connection, config }, message, videoMessage) {
     const chat = message.key.remoteJid;
     const work = createWorkDir(config);
     const video = path.join(work.dir, 'input.mp4');
     const webp = path.join(work.dir, 'sticker.webp');
     try {
-        const info = await downloadAndProbe(sock, message, video);
-        if (!info.hasAudio) {
-            await sock.sendMessage(chat, { text: 'That video has no audio.' }, { quoted: message });
-            return;
-        }
+        const info = await downloadAndProbe(connection, message, video);
         const duration = clipDuration(info.duration, videoMessage.seconds, config.maxSeconds);
         await convertToSticker(video, webp, duration, { maxBytes: config.maxStickerBytes, maxFrames: config.maxFrames });
         const animation = parseWebp(fs.readFileSync(webp));
         const finalDuration = animation && animation.duration > 0 ? animation.duration : duration;
 
-        await sock.sendMessage(chat, {
-            text: `TEST: ${TEST_VARIANTS.length} numbered stickers, same animation, different audio encoding. Which ones play?`
-        });
+        await sendText(connection, chat,
+            `TEST: ${TEST_VARIANTS.length} numbered stickers, same animation, different audio encoding. Which ones play?`);
         for (const [index, variant] of TEST_VARIANTS.entries()) {
             const ogg = path.join(work.dir, `audio_${index + 1}_${variant.mode}.ogg`);
             await extractAudio(video, ogg, finalDuration, { mode: variant.mode, kbps: config.audioKbps, leadMs: config.audioLeadMs });
             const label = `Variant ${index + 1}: ${variant.label} (${formatKb(fs.statSync(ogg).size)})`;
-            await sock.sendMessage(chat, { text: label });
-            await sendSoundSticker(sock, chat, { webpPath: webp, oggPath: ogg, seconds: Math.max(1, Math.round(finalDuration)), debug: config.debug });
+            await sendText(connection, chat, label);
+            await sendSoundSticker(connection, chat, { webpPath: webp, oggPath: ogg, seconds: Math.max(1, Math.round(finalDuration)), debug: config.debug });
             log('TEST', label);
         }
     } finally {
